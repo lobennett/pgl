@@ -310,8 +310,9 @@ def _run_prompted_mode(args, event_log, input_fn):
         prompt_and_mark(
             event_log,
             input_fn,
-            "power_cycle",
-            "Power-cycle only the DATAPixx once.",
+            "bus_power_device",
+            "During the run, plug in one designated bus-powered device on the "
+            "documented shared USB bus. Leave the DATAPixx powered and untouched.",
         )
     elif args.wiggle:
         actions = (

@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -157,6 +158,32 @@ def test_kvm_prompt_marks_before_and_after_action(tmp_path):
     assert marker_names(path) == [
         "kvm_switch_requested",
         "kvm_switch_completed",
+    ]
+
+
+def test_power_prompt_adds_bus_load_without_touching_datapixx(tmp_path):
+    """Would catch power mode cycling the DATAPixx instead of adding bus load."""
+    instruction = (
+        "During the run, plug in one designated bus-powered device on the "
+        "documented shared USB bus. Leave the DATAPixx powered and untouched."
+    )
+    prompts = []
+    answers = iter(["", ""])
+    path = tmp_path / "run.csv"
+    args = SimpleNamespace(kvm=False, power=True, wiggle=False)
+    with CsvEventLog(path) as log:
+        provoke._run_prompted_mode(
+            args,
+            log,
+            lambda prompt: prompts.append(prompt) or next(answers),
+        )
+    assert prompts == [
+        f"{instruction}\nPress Enter when ready to perform it: ",
+        "Press Enter after completing the action: ",
+    ]
+    assert marker_names(path) == [
+        "bus_power_device_requested",
+        "bus_power_device_completed",
     ]
 
 
@@ -605,7 +632,7 @@ def test_main_restores_sigint_handler_and_joins_soak_thread(tmp_path):
     ("mode_args", "stdin", "expected_marker"),
     [
         (["--kvm"], "\n\n", "kvm_switch_completed"),
-        (["--power"], "\n\n", "power_cycle_completed"),
+        (["--power"], "\n\n", "bus_power_device_completed"),
         (["--bandwidth"], "", "bandwidth_stopped"),
         (["--stale-handle"], "", "stale_handle_reopen_refused"),
         (["--no-flush"], "", "worker_closed"),

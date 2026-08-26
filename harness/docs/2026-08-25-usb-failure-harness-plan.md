@@ -729,10 +729,12 @@ Expected: collection fails because `harness.provoke` does not exist.
 
 - [ ] **Step 3: Implement the mutually exclusive parser and human prompts**
 
-KVM and power each use before/after Enter prompts. Wiggle calls the same helper
-in this fixed order: Mac connector, DATAPixx connector, MSR feedthrough. Every
-instruction names the one physical action to perform. `--kvm` appears first in
-CLI help and README examples.
+KVM and power each use before/after Enter prompts. In power mode, the operator
+plugs in one designated bus-powered device on the documented shared USB bus
+mid-run and leaves the DATAPixx powered and untouched. Wiggle calls the same
+helper in this fixed order: Mac connector, DATAPixx connector, MSR feedthrough.
+Every instruction names the one physical action to perform. `--kvm` appears
+first in CLI help and README examples.
 
 - [ ] **Step 4: Write failing bandwidth and stale-handle tests**
 

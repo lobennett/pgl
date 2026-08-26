@@ -57,10 +57,10 @@ python3 -m harness.soak --csv logs/baseline.csv --text-log logs/baseline.log
 Run one mode at a time. The first mode is the easiest place to begin because it only asks for one KVM switch; respond to each prompt only after the requested action. The hardware commands below are intentionally not simulation commands.
 
 ```bash
-# Easiest first: switch the KVM once, then return the chain to its normal state.
+# Easiest first: switch the KVM once, then return to this terminal.
 python3 -m harness.provoke --kvm --duration 120 --csv logs/kvm.csv --text-log logs/kvm.log
 
-# Power-cycle only the DATAPixx.
+# During the run, plug in one designated bus-powered device on the documented shared USB bus. Leave the DATAPixx powered and untouched.
 python3 -m harness.provoke --power --duration 120 --csv logs/power.csv
 
 # Read, but never write, a large existing file on the USB volume under test.
@@ -154,7 +154,7 @@ Keep the cable route, device firmware, trigger cadence, and downstream recording
 | --- | --- | --- | --- |
 | KVM re-enumeration | Switch the KVM once during `--kvm`. | USB log shows remove/add and the CSV fails near the KVM markers or needs reopen. | No USB event, failure, or recovery change at the markers. |
 | Bus bandwidth | Read only one large file from the target USB volume with `--bandwidth`. | Failures cluster after `bandwidth_started` or at a reproducible read load. | Baseline and read-load runs behave alike. |
-| Bus power | Power-cycle only the DATAPixx with `--power`; compare saved topology before and after. | Re-enumeration, current warning, or recovery pattern tracks that cycle. | Stable topology and no change in failure behavior. |
+| Bus power | During `--power`, plug in one designated bus-powered device on the documented shared USB bus; leave the DATAPixx powered and untouched. | A failure, current warning, or recovery pattern starts near the bus-power markers. | Baseline and added-load runs behave alike. |
 | Stale handle | Run `--stale-handle`; change no cable or power state. | Immediate reopen refusal follows the deliberate child crash. | New worker opens cleanly and the failure needs another explanation. |
 | Missing register flush | Run one `--no-flush` control. | Simulation reports `no_emission`; real hardware is deliberately `uncommitted`. | Any electrical conclusion from this control alone is invalid; add loopback measurement. |
 | Cable, connectors, or feedthrough | Use `--wiggle` and perform only the prompted connector action in order. | Failure, USB event, or recovery tracks one connector's marker pair. | Repeated isolated actions show no temporal association. |

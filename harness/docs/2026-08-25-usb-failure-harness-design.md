@@ -105,8 +105,10 @@ event and reaches that cleanup path.
 `harness/provoke.py` wraps the soak runner and changes only the mode selected by
 the operator:
 
-- KVM, power, and cable-wiggle modes write markers before and after each
-  prompted action.
+- KVM and cable-wiggle modes write markers before and after each prompted
+  action. Power mode instead prompts the operator to plug in one designated
+  bus-powered device on the documented shared USB bus mid-run, while leaving
+  the DATAPixx powered and untouched; it records the same before/after markers.
 - Bandwidth mode repeatedly reads an existing large file supplied through
   `--bandwidth-source`. It creates or deletes no files on the USB volume.
 - Stale-handle mode opens the device in a helper process, exits it without
