@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import multiprocessing
 import sys
+import time
 from dataclasses import dataclass, field
 from multiprocessing.connection import Connection
 from typing import Any
@@ -15,6 +16,18 @@ class WorkerTimeout(TimeoutError):
 
 class WorkerProtocolError(RuntimeError):
     """Raised when the device process sends an invalid reply."""
+
+
+class WorkerCloseError(RuntimeError):
+    """Raised when the child reports that device close failed."""
+
+
+class WorkerForcedTermination(WorkerCloseError):
+    """Raised when graceful close was acknowledged but the child did not exit."""
+
+
+class WorkerCancelled(WorkerProtocolError):
+    """Raised when a caller cancels a pending worker reply."""
 
 
 @dataclass(frozen=True)
@@ -29,6 +42,7 @@ class WorkerConfig:
 
 _MAX_CONDITION_TABLE_ALLOCATION = 256 * 1024 * 1024
 _UINT32_MAX = (1 << 32) - 1
+_REPLY_POLL_SLICE = 0.05
 
 
 def _validate_config(config: WorkerConfig):
@@ -174,11 +188,9 @@ def _trigger_device(dp, config: WorkerConfig, layout, command):
     error_code = dp.DPxGetError()
     error_string = dp.DPxGetErrorString()
     ready = dp.DPxIsReady()
-    emitted = (
-        len(dp.get_mock_state()["emissions"]) > before
-        if config.simulate
-        else None
-    )
+    state = dp.get_mock_state() if config.simulate else None
+    emitted = len(state["emissions"]) > before if config.simulate else None
+    samples = state["emissions"][-1]["samples"] if emitted else None
     reply = {
         "ok": ready and error_code == "DPX_SUCCESS",
         "ready": ready,
@@ -186,6 +198,7 @@ def _trigger_device(dp, config: WorkerConfig, layout, command):
         "error_string": error_string,
         "device_time": device_time,
         "emitted": emitted,
+        "samples": samples,
         "electrically_verified": False,
     }
     dp.DPxClearError()
@@ -211,6 +224,7 @@ def _trigger_device(dp, config: WorkerConfig, layout, command):
 def _worker_main(connection: Connection, config: WorkerConfig):
     dp = None
     close_device = False
+    close_attempted = False
     try:
         dp = _backend(config)
         opened = _open_device(dp, config)
@@ -223,8 +237,15 @@ def _worker_main(connection: Connection, config: WorkerConfig):
             if command["command"] == "trigger":
                 connection.send(_trigger_device(dp, config, layout, command))
             elif command["command"] == "close":
-                close_device = True
-                connection.send({"ok": True})
+                close_attempted = True
+                try:
+                    dp.DPxClose()
+                except Exception as exc:
+                    connection.send(
+                        {"close_error": f"{type(exc).__name__}: {exc}"}
+                    )
+                    return
+                connection.send({"ok": True, "outcome": "closed"})
                 return
             else:
                 raise WorkerProtocolError(f"unknown command: {command!r}")
@@ -239,7 +260,7 @@ def _worker_main(connection: Connection, config: WorkerConfig):
         except (BrokenPipeError, EOFError):
             pass
     finally:
-        if close_device and dp is not None:
+        if close_device and not close_attempted and dp is not None:
             try:
                 dp.DPxClose()
             except Exception:
@@ -258,15 +279,41 @@ class DeviceWorker:
     def is_alive(self):
         return self._process is not None and self._process.is_alive()
 
-    def _receive(self, timeout):
+    def _receive(
+        self,
+        timeout,
+        *,
+        cancel_event=None,
+        progress_callback=None,
+    ):
         if self._connection is None:
             raise WorkerProtocolError("worker has not been started")
-        try:
-            ready = self._connection.poll(timeout)
-        except (BrokenPipeError, EOFError, OSError) as exc:
-            raise WorkerProtocolError("worker pipe poll failed") from exc
-        if not ready:
-            raise WorkerTimeout("worker reply timed out")
+        deadline = (
+            None if timeout is None else time.monotonic() + max(0.0, timeout)
+        )
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise WorkerCancelled("worker reply cancelled")
+            remaining = (
+                None if deadline is None else max(0.0, deadline - time.monotonic())
+            )
+            poll_timeout = (
+                _REPLY_POLL_SLICE
+                if remaining is None
+                else min(_REPLY_POLL_SLICE, remaining)
+            )
+            try:
+                ready = self._connection.poll(poll_timeout)
+            except (BrokenPipeError, EOFError, OSError) as exc:
+                raise WorkerProtocolError("worker pipe poll failed") from exc
+            if ready:
+                break
+            if progress_callback is not None:
+                progress_callback()
+            if cancel_event is not None and cancel_event.is_set():
+                raise WorkerCancelled("worker reply cancelled")
+            if deadline is not None and time.monotonic() >= deadline:
+                raise WorkerTimeout("worker reply timed out")
         try:
             reply = self._connection.recv()
         except (BrokenPipeError, EOFError, OSError) as exc:
@@ -275,6 +322,8 @@ class DeviceWorker:
             raise WorkerProtocolError(f"invalid worker reply: {reply!r}")
         if "protocol_error" in reply:
             raise WorkerProtocolError(reply["protocol_error"])
+        if "close_error" in reply:
+            raise WorkerCloseError(reply["close_error"])
         return reply
 
     def _send(self, command):
@@ -303,7 +352,13 @@ class DeviceWorker:
         if process is not None:
             process.close()
 
-    def start(self, timeout):
+    def start(
+        self,
+        timeout,
+        *,
+        cancel_event=None,
+        progress_callback=None,
+    ):
         if self._process is not None:
             raise WorkerProtocolError("worker has already been started")
         context = multiprocessing.get_context("spawn")
@@ -319,9 +374,21 @@ class DeviceWorker:
             self._cleanup_resources(child)
             raise
         child.close()
-        return self._receive(timeout)
+        return self._receive(
+            timeout,
+            cancel_event=cancel_event,
+            progress_callback=progress_callback,
+        )
 
-    def trigger(self, code, *, flush=True, timeout=None):
+    def trigger(
+        self,
+        code,
+        *,
+        flush=True,
+        timeout=None,
+        cancel_event=None,
+        progress_callback=None,
+    ):
         if self._connection is None or not self.is_alive:
             raise WorkerProtocolError("worker is not running")
         max_code = (1 << self.config.num_bits) - 1
@@ -334,25 +401,86 @@ class DeviceWorker:
         self._send(
             {"command": "trigger", "code": code, "flush": flush}
         )
-        return self._receive(timeout)
+        return self._receive(
+            timeout,
+            cancel_event=cancel_event,
+            progress_callback=progress_callback,
+        )
 
-    def close(self, timeout=1.0):
+    def _wait_for_exit(
+        self,
+        deadline,
+        *,
+        cancel_event=None,
+        progress_callback=None,
+    ):
+        while self.is_alive:
+            if cancel_event is not None and cancel_event.is_set():
+                raise WorkerCancelled("worker close cancelled")
+            remaining = (
+                None if deadline is None else max(0.0, deadline - time.monotonic())
+            )
+            if remaining == 0:
+                raise WorkerForcedTermination(
+                    "worker close required forced termination"
+                )
+            join_timeout = (
+                _REPLY_POLL_SLICE
+                if remaining is None
+                else min(_REPLY_POLL_SLICE, remaining)
+            )
+            self._process.join(join_timeout)
+            if self.is_alive and progress_callback is not None:
+                progress_callback()
+
+    def close(
+        self,
+        timeout=1.0,
+        *,
+        cancel_event=None,
+        progress_callback=None,
+    ):
         if self._process is None:
             return
-        if self.is_alive and self._connection is not None:
-            try:
+        deadline = (
+            None if timeout is None else time.monotonic() + max(0.0, timeout)
+        )
+        try:
+            if self.is_alive and self._connection is not None:
                 self._send({"command": "close"})
-                self._receive(timeout)
-                self._process.join(timeout)
-            except (BrokenPipeError, EOFError, WorkerProtocolError, WorkerTimeout):
+                receive_timeout = (
+                    None
+                    if deadline is None
+                    else max(0.0, deadline - time.monotonic())
+                )
+                reply = self._receive(
+                    receive_timeout,
+                    cancel_event=cancel_event,
+                    progress_callback=progress_callback,
+                )
+                if reply.get("ok") is not True or reply.get("outcome") != "closed":
+                    raise WorkerCloseError(
+                        f"invalid worker close reply: {reply!r}"
+                    )
+                self._wait_for_exit(
+                    deadline,
+                    cancel_event=cancel_event,
+                    progress_callback=progress_callback,
+                )
+            else:
+                self._process.join(0)
+                raise WorkerCloseError(
+                    "worker exited before device close could complete"
+                )
+        except WorkerTimeout as exc:
+            self.terminate()
+            raise WorkerTimeout("worker close timed out") from exc
+        except BaseException:
+            if self._process is not None:
                 self.terminate()
-                return
-            if self.is_alive:
-                self.terminate()
-                return
-        else:
-            self._process.join(0)
+            raise
         self._cleanup_resources()
+        return reply
 
     def terminate(self):
         if self._process is not None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import signal
 import threading
@@ -112,7 +113,13 @@ class SoakRunner:
             f"attempted_triggers={self.sequence_number}"
         )
         if self.config.heartbeat_interval > 0:
-            self._next_heartbeat += self.config.heartbeat_interval
+            missed_intervals = int(
+                (now - self._next_heartbeat)
+                // self.config.heartbeat_interval
+            ) + 1
+            self._next_heartbeat += (
+                missed_intervals * self.config.heartbeat_interval
+            )
         else:
             self._next_heartbeat = now
 
@@ -137,6 +144,13 @@ class SoakRunner:
         if now is None:
             now = time.monotonic()
         return now >= self._duration_deadline
+
+    def _effective_call_timeout(self):
+        timeout = self.config.call_timeout
+        if self._duration_deadline is None:
+            return timeout
+        remaining = max(0.0, self._duration_deadline - time.monotonic())
+        return min(timeout, remaining)
 
     def _wait_until(self, operation_deadline):
         while True:
@@ -173,6 +187,18 @@ class SoakRunner:
             self.config.max_triggers is not None
             and self.sequence_number >= self.config.max_triggers
         ) or self._duration_reached()
+
+    def _advance_trigger_deadline(self, previous_deadline):
+        next_deadline = previous_deadline + self.config.interval
+        if self.config.interval <= 0:
+            return next_deadline
+        behind = time.monotonic() - next_deadline
+        if behind > 0:
+            next_deadline += (
+                math.ceil(behind / self.config.interval)
+                * self.config.interval
+            )
+        return next_deadline
 
     @staticmethod
     def _opened_successfully(result):
@@ -216,7 +242,11 @@ class SoakRunner:
     def _new_started_worker(self):
         worker = self.worker_factory(self._worker_config())
         try:
-            result = worker.start(timeout=self.config.call_timeout)
+            result = worker.start(
+                timeout=self._effective_call_timeout(),
+                cancel_event=self.stop_event,
+                progress_callback=self._maybe_heartbeat,
+            )
         except Exception:
             worker.terminate()
             raise
@@ -320,6 +350,7 @@ class SoakRunner:
                 self._emit_failure(opened)
                 if not self._recover():
                     return
+                next_trigger = time.monotonic()
 
             while not self.stop_event.is_set() and not self._run_limit_reached():
                 if not self._wait_until(next_trigger):
@@ -332,28 +363,45 @@ class SoakRunner:
                     result = self.worker.trigger(
                         code,
                         flush=self.config.flush_triggers,
-                        timeout=self.config.call_timeout,
+                        timeout=self._effective_call_timeout(),
+                        cancel_event=self.stop_event,
+                        progress_callback=self._maybe_heartbeat,
                     )
                 except Exception as exception:
                     result = self._exception_result(exception)
                 latency_ms = (time.monotonic() - call_started) * 1000.0
                 self._write_trigger(code, result, latency_ms)
                 self._maybe_heartbeat()
-                next_trigger += self.config.interval
 
                 if not self._trigger_succeeded(result):
                     self._emit_failure(result)
+                    if self._run_limit_reached() or self.stop_event.is_set():
+                        break
                     if not self._recover():
                         break
+                    next_trigger = time.monotonic()
+                else:
+                    next_trigger = self._advance_trigger_deadline(next_trigger)
         finally:
             if self.worker is not None:
                 try:
-                    self.worker.close(timeout=self.config.call_timeout)
+                    cancel_event = (
+                        None if self.stop_event.is_set() else self.stop_event
+                    )
+                    self.worker.close(
+                        timeout=self._effective_call_timeout(),
+                        cancel_event=cancel_event,
+                        progress_callback=self._maybe_heartbeat,
+                    )
                 except Exception as exception:
                     self.worker.terminate()
                     self.event_log.write_marker(
                         "worker_close_failed",
                         f"{type(exception).__name__}: {exception}",
+                        error_code=type(exception).__name__,
+                        error_string=str(exception),
+                        ready=False,
+                        outcome="close_failed",
                     )
                 else:
                     self.event_log.write_marker("worker_closed")
@@ -394,7 +442,16 @@ def _close_runner_worker(runner):
 
 
 def main(argv=None):
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    failure_injection_requested = (
+        args.simulate_fail_after_calls is not None
+        or args.simulate_fail_after_seconds is not None
+    )
+    if failure_injection_requested and args.duration is None:
+        parser.error(
+            "--duration is required with simulation failure injection flags"
+        )
     event_log = CsvEventLog(args.csv)
     runner = SoakRunner(_config_from_args(args), event_log)
 

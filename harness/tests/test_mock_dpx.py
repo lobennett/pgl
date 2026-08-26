@@ -148,3 +148,26 @@ def test_silent_failure_keeps_success_and_drops_emission():
     assert mock_dpx.DPxGetError() == "DPX_SUCCESS"
     assert mock_dpx.DPxIsReady() is True
     assert mock_dpx.get_mock_state()["emissions"] == []
+
+
+def test_error_latched_calls_do_not_mutate_trigger_state_or_emit():
+    """Would catch error-mode calls continuing to stage or emit a trigger."""
+    mock_dpx.configure(
+        fail_after_calls=0,
+        failure_mode="error",
+        error_code="DPX_ERR_TEST",
+    )
+    mock_dpx.DPxOpen()
+
+    mock_dpx.DPxWriteRam(8_000_000, [9, 9, 0])
+    mock_dpx.DPxSetDoutSchedule(0.0, 1000, 3, 8_000_000)
+    mock_dpx.DPxStartDoutSched()
+    mock_dpx.DPxWriteRegCache()
+
+    state = mock_dpx.get_mock_state()
+    assert state["error_code"] == "DPX_ERR_TEST"
+    assert state["pending_ram"] == {}
+    assert state["committed_ram"] == {}
+    assert state["pending_schedule"] is None
+    assert state["schedule_started"] is False
+    assert state["emissions"] == []

@@ -18,8 +18,8 @@ class _MockState:
     opened_at: float | None = None
     error_code: str = "DPX_SUCCESS"
     error_string: str = "Success"
-    pending_ram: dict[int, list[int]] = field(default_factory=dict)
-    committed_ram: dict[int, list[int]] = field(default_factory=dict)
+    pending_ram: dict[int, int] = field(default_factory=dict)
+    committed_ram: dict[int, int] = field(default_factory=dict)
     pending_schedule: tuple[float, int, int, int] | None = None
     schedule_started: bool = False
     emissions: list[dict[str, object]] = field(default_factory=list)
@@ -94,8 +94,8 @@ def get_mock_state() -> dict:
             "opened_at": _state.opened_at,
             "error_code": _state.error_code,
             "error_string": _state.error_string,
-            "pending_ram": {key: value.copy() for key, value in _state.pending_ram.items()},
-            "committed_ram": {key: value.copy() for key, value in _state.committed_ram.items()},
+            "pending_ram": _state.pending_ram.copy(),
+            "committed_ram": _state.committed_ram.copy(),
             "pending_schedule": _state.pending_schedule,
             "schedule_started": _state.schedule_started,
             "emissions": [emission.copy() for emission in _state.emissions],
@@ -121,10 +121,10 @@ def _threshold_reached(state, now):
     return calls_reached or time_reached
 
 
-def _before_call(_name: str) -> None:
+def _before_call(_name: str) -> bool:
     with _lock:
         if _name == "DPxIsReady" or not _state.opened:
-            return
+            return True
         if not _state.fault_latched:
             if _threshold_reached(_state, time.monotonic()):
                 _state.fault_latched = True
@@ -134,14 +134,20 @@ def _before_call(_name: str) -> None:
                     _state.commits_dropped = True
             else:
                 _state.call_count += 1
-                return
+                return True
         should_hang = _state.failure_mode == "hang"
+        should_raise = _state.failure_mode == "exception"
+        exception_message = _state.configured_error_string
+        call_succeeds = _state.failure_mode != "error"
     if should_hang:
         _hang_entered.set()
         try:
             _hang_released.wait()
         finally:
             _hang_entered.clear()
+    if should_raise:
+        raise RuntimeError(exception_message)
+    return call_succeeds
 
 
 def _set_error(code: str, message: str) -> None:
@@ -150,10 +156,9 @@ def _set_error(code: str, message: str) -> None:
 
 
 def DPxOpen():
-    _before_call("DPxOpen")
+    if not _before_call("DPxOpen"):
+        return
     with _lock:
-        if _state.fault_latched and _state.failure_mode == "error":
-            return
         marker = _state.persistent_handle_path
         if _state.opened:
             _set_error("DPX_ERR_ALREADY_OPEN", "DATAPixx connection is already open")
@@ -172,7 +177,8 @@ def DPxOpen():
 
 
 def DPxClose():
-    _before_call("DPxClose")
+    if not _before_call("DPxClose"):
+        return
     with _lock:
         if _state.owns_persistent_handle and _state.persistent_handle_path is not None:
             try:
@@ -211,43 +217,53 @@ def DPxUpdateRegCache():
 
 
 def DPxWriteRegCache():
-    _before_call("DPxWriteRegCache")
+    if not _before_call("DPxWriteRegCache"):
+        return
     with _lock:
         if _state.commits_dropped:
             _state.pending_ram.clear()
             _state.schedule_started = False
             return
-        _state.committed_ram.update(
-            {address: values.copy() for address, values in _state.pending_ram.items()}
-        )
+        _state.committed_ram.update(_state.pending_ram)
         _state.pending_ram.clear()
         if _state.schedule_started and _state.pending_schedule is not None:
             _, rate, length, address = _state.pending_schedule
+            samples = []
+            for index in range(length):
+                sample_address = address + index * 2
+                if sample_address not in _state.committed_ram:
+                    break
+                samples.append(_state.committed_ram[sample_address])
             _state.emissions.append(
                 {
                     "address": address,
                     "rate": rate,
                     "length": length,
-                    "samples": _state.committed_ram.get(address, [])[:length],
+                    "samples": samples,
                 }
             )
             _state.schedule_started = False
 
 
 def DPxWriteRam(address, values):
-    _before_call("DPxWriteRam")
+    if not _before_call("DPxWriteRam"):
+        return
     with _lock:
-        _state.pending_ram[int(address)] = [int(value) for value in values]
+        start_address = int(address)
+        for index, value in enumerate(values):
+            _state.pending_ram[start_address + index * 2] = int(value)
 
 
 def DPxSetDoutSchedule(delay, rate, length, address):
-    _before_call("DPxSetDoutSchedule")
+    if not _before_call("DPxSetDoutSchedule"):
+        return
     with _lock:
         _state.pending_schedule = (delay, rate, length, address)
 
 
 def DPxSetDoutSched(delay, rate, _units, length):
-    _before_call("DPxSetDoutSched")
+    if not _before_call("DPxSetDoutSched"):
+        return
     with _lock:
         address = _state.dout_buffer[0] if _state.dout_buffer is not None else 0
         _state.pending_schedule = (delay, rate, length, address)
@@ -258,7 +274,8 @@ def DPxSetDoutSchedRate(_rate, _units):
 
 
 def DPxStartDoutSched():
-    _before_call("DPxStartDoutSched")
+    if not _before_call("DPxStartDoutSched"):
+        return
     with _lock:
         _state.schedule_started = True
 
@@ -290,7 +307,8 @@ def DPxIsDacSchedRunning():
 
 
 def _set_pixel_mode(enabled):
-    _before_call("pixel_mode")
+    if not _before_call("pixel_mode"):
+        return
     with _lock:
         _state.pixel_mode = enabled
 
@@ -320,7 +338,8 @@ def DPxEnableDoutPixelModeGB():
 
 
 def DPxStopAllScheds():
-    _before_call("DPxStopAllScheds")
+    if not _before_call("DPxStopAllScheds"):
+        return
     with _lock:
         _state.schedule_started = False
 
@@ -356,13 +375,15 @@ def DPxSetDinLog(_address, _frames):
 
 
 def DPxStartDinLog():
-    _before_call("DPxStartDinLog")
+    if not _before_call("DPxStartDinLog"):
+        return
     with _lock:
         _state.din_logging = True
 
 
 def DPxGetDinStatus(status):
-    _before_call("DPxGetDinStatus")
+    if not _before_call("DPxGetDinStatus"):
+        return
     status.update({"newLogFrames": 0, "currentReadFrame": 0})
 
 
@@ -382,6 +403,7 @@ def DPxGetDoutNumBits():
 
 
 def DPxSetDoutBuff(address, size):
-    _before_call("DPxSetDoutBuff")
+    if not _before_call("DPxSetDoutBuff"):
+        return
     with _lock:
         _state.dout_buffer = (address, size)

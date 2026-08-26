@@ -1,7 +1,9 @@
 import csv
+import os
 import signal
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -43,18 +45,18 @@ class ScriptedWorker:
         }
         self.closed = False
 
-    def start(self, timeout):
+    def start(self, timeout, **kwargs):
         if isinstance(self.start_result, BaseException):
             raise self.start_result
         return self.start_result
 
-    def trigger(self, code, flush=True, timeout=None):
+    def trigger(self, code, flush=True, timeout=None, **kwargs):
         result = self.results.pop(0)
         if isinstance(result, BaseException):
             raise result
         return result
 
-    def close(self, timeout=1.0):
+    def close(self, timeout=1.0, **kwargs):
         self.closed = True
 
     def terminate(self):
@@ -154,6 +156,41 @@ def test_failure_logs_and_reopens_before_continuing(tmp_path):
     assert marker_names(tmp_path / "run.csv").count("reopen_succeeded") == 1
 
 
+def test_last_allowed_failed_trigger_does_not_reopen(tmp_path):
+    """Would catch opening a replacement after no trigger attempts remain."""
+    failed = ScriptedWorker(
+        [
+            {
+                "ok": False,
+                "ready": False,
+                "error_code": "DPX_ERR_USB",
+                "error_string": "gone",
+                "device_time": None,
+                "emitted": False,
+                "outcome": "device_error",
+            }
+        ]
+    )
+    unused_replacement = ScriptedWorker([successful_result()])
+    workers = iter([failed, unused_replacement])
+    factory_calls = []
+    with CsvEventLog(tmp_path / "run.csv") as event_log:
+        runner = SoakRunner(
+            SoakConfig(interval=0, reopen_interval=0, max_triggers=1),
+            event_log,
+            worker_factory=lambda worker_config: (
+                factory_calls.append(worker_config) or next(workers)
+            ),
+        )
+        runner.run()
+
+    assert len(factory_calls) == 1
+    assert not any(
+        marker.startswith("reopen_")
+        for marker in marker_names(tmp_path / "run.csv")
+    )
+
+
 @pytest.mark.parametrize(
     ("exception", "outcome"),
     [
@@ -228,8 +265,13 @@ def test_stop_after_first_trigger_closes_worker_and_logs_close(tmp_path):
         )
         original_trigger = worker.trigger
 
-        def trigger_and_stop(code, flush=True, timeout=None):
-            result = original_trigger(code, flush=flush, timeout=timeout)
+        def trigger_and_stop(code, flush=True, timeout=None, **kwargs):
+            result = original_trigger(
+                code,
+                flush=flush,
+                timeout=timeout,
+                **kwargs,
+            )
             runner.stop_event.set()
             return result
 
@@ -239,6 +281,21 @@ def test_stop_after_first_trigger_closes_worker_and_logs_close(tmp_path):
     assert worker.closed is True
     assert len(trigger_rows(tmp_path / "run.csv")) == 1
     assert marker_names(tmp_path / "run.csv")[-1] == "worker_closed"
+
+
+def test_close_exception_logs_failure_without_graceful_marker(tmp_path):
+    """Would catch labeling an exceptional device close as worker_closed."""
+    class CloseFailingWorker(ScriptedWorker):
+        def close(self, timeout=1.0, **kwargs):
+            raise RuntimeError("DPxClose exploded")
+
+    worker = CloseFailingWorker([])
+    run_soak(tmp_path, SoakConfig(max_triggers=0), worker)
+
+    markers = marker_names(tmp_path / "run.csv")
+    assert "worker_close_failed" in markers
+    assert "worker_closed" not in markers
+    assert worker.closed is True
 
 
 @pytest.mark.parametrize("interrupt", [KeyboardInterrupt(), SystemExit(2)])
@@ -279,8 +336,13 @@ def test_trigger_waits_use_absolute_deadlines(monkeypatch, tmp_path):
     worker = ScriptedWorker([successful_result()] * 3)
     original_trigger = worker.trigger
 
-    def slow_trigger(code, flush=True, timeout=None):
-        result = original_trigger(code, flush=flush, timeout=timeout)
+    def slow_trigger(code, flush=True, timeout=None, **kwargs):
+        result = original_trigger(
+            code,
+            flush=flush,
+            timeout=timeout,
+            **kwargs,
+        )
         clock.now += 0.25
         return result
 
@@ -296,6 +358,99 @@ def test_trigger_waits_use_absolute_deadlines(monkeypatch, tmp_path):
         runner.run()
 
     assert stop_event.waits == [0.0, 0.75, 0.75]
+
+
+def test_successful_recovery_rebases_trigger_cadence_without_catch_up(
+    monkeypatch, tmp_path
+):
+    """Would catch a long recovery draining missed trigger deadlines in a burst."""
+    clock = FakeClock()
+    stop_event = AdvancingStopEvent(clock)
+    trigger_times = []
+
+    class TimedWorker(ScriptedWorker):
+        def trigger(self, code, flush=True, timeout=None, **kwargs):
+            trigger_times.append(clock.now)
+            return super().trigger(
+                code,
+                flush=flush,
+                timeout=timeout,
+                **kwargs,
+            )
+
+    failed = TimedWorker(
+        [
+            {
+                "ok": False,
+                "ready": False,
+                "error_code": "DPX_ERR_USB",
+                "error_string": "gone",
+                "device_time": None,
+                "emitted": False,
+                "outcome": "device_error",
+            }
+        ]
+    )
+    recovered = TimedWorker([successful_result(), successful_result()])
+    workers = iter([failed, recovered])
+    monkeypatch.setattr(soak.time, "monotonic", clock.monotonic)
+
+    with CsvEventLog(tmp_path / "run.csv") as event_log:
+        runner = SoakRunner(
+            SoakConfig(
+                interval=2,
+                reopen_interval=7,
+                heartbeat_interval=100,
+                max_triggers=3,
+            ),
+            event_log,
+            worker_factory=lambda worker_config: next(workers),
+        )
+        runner.stop_event = stop_event
+        runner.run()
+
+    assert trigger_times == [0, 7, 9]
+
+
+def test_successful_blocked_trigger_skips_expired_cadence_deadlines(
+    monkeypatch, tmp_path
+):
+    """Would catch a long successful call causing an immediate catch-up burst."""
+    clock = FakeClock()
+    stop_event = AdvancingStopEvent(clock)
+    trigger_times = []
+
+    class SlowFirstTriggerWorker(ScriptedWorker):
+        def trigger(self, code, flush=True, timeout=None, **kwargs):
+            trigger_times.append(clock.now)
+            result = super().trigger(
+                code,
+                flush=flush,
+                timeout=timeout,
+                **kwargs,
+            )
+            if len(trigger_times) == 1:
+                clock.now = 3.4
+            return result
+
+    worker = SlowFirstTriggerWorker(
+        [successful_result(), successful_result()]
+    )
+    monkeypatch.setattr(soak.time, "monotonic", clock.monotonic)
+    with CsvEventLog(tmp_path / "run.csv") as event_log:
+        runner = SoakRunner(
+            SoakConfig(
+                interval=1,
+                heartbeat_interval=100,
+                max_triggers=2,
+            ),
+            event_log,
+            worker_factory=lambda worker_config: worker,
+        )
+        runner.stop_event = stop_event
+        runner.run()
+
+    assert trigger_times == [0, 4]
 
 
 def test_duration_caps_long_normal_interval_at_absolute_deadline(
@@ -421,6 +576,85 @@ def test_heartbeats_fire_at_each_deadline_during_long_reopen_wait(
         for name in marker_names(tmp_path / "run.csv")
         if name.startswith("reopen_")
     ] == []
+
+
+def test_missed_heartbeat_deadlines_emit_once_without_catch_up_burst(
+    monkeypatch, tmp_path, capsys
+):
+    """Would catch repeated immediate heartbeats after one delayed callback."""
+    clock = FakeClock()
+    clock.now = 3.4
+    monkeypatch.setattr(soak.time, "monotonic", clock.monotonic)
+    with CsvEventLog(tmp_path / "run.csv") as event_log:
+        runner = SoakRunner(
+            SoakConfig(heartbeat_interval=1),
+            event_log,
+            worker_factory=lambda worker_config: None,
+        )
+        runner._started_at = 0
+        runner._next_heartbeat = 1
+        runner._maybe_heartbeat()
+        runner._maybe_heartbeat()
+
+    heartbeats = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("heartbeat ")
+    ]
+    assert heartbeats == [
+        "heartbeat elapsed=3.400s attempted_triggers=0"
+    ]
+
+
+def test_trigger_call_uses_remaining_duration_and_reports_heartbeats(
+    monkeypatch, tmp_path, capsys
+):
+    """Would catch forwarding a long timeout or going silent during a call."""
+    clock = FakeClock()
+    observed_timeouts = []
+
+    class ProgressWorker(ScriptedWorker):
+        def trigger(
+            self,
+            code,
+            flush=True,
+            timeout=None,
+            progress_callback=None,
+            **kwargs,
+        ):
+            observed_timeouts.append(timeout)
+            for now in (0.5, 1.0, 1.1):
+                clock.now = now
+                if progress_callback is not None:
+                    progress_callback()
+            return super().trigger(code, flush=flush, timeout=timeout)
+
+    worker = ProgressWorker([successful_result()])
+    monkeypatch.setattr(soak.time, "monotonic", clock.monotonic)
+    with CsvEventLog(tmp_path / "run.csv") as event_log:
+        runner = SoakRunner(
+            SoakConfig(
+                interval=10,
+                call_timeout=20,
+                heartbeat_interval=0.5,
+                duration=1.25,
+                max_triggers=1,
+            ),
+            event_log,
+            worker_factory=lambda worker_config: worker,
+        )
+        runner.run()
+
+    heartbeats = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("heartbeat ")
+    ]
+    assert observed_timeouts == [1.25]
+    assert heartbeats == [
+        "heartbeat elapsed=0.500s attempted_triggers=1",
+        "heartbeat elapsed=1.000s attempted_triggers=1",
+    ]
 
 
 def test_stop_event_interrupts_deadline_wait_without_more_work(
@@ -549,7 +783,7 @@ def test_heartbeats_continue_during_recovery(monkeypatch, tmp_path, capsys):
                 interval=0,
                 reopen_interval=0.6,
                 heartbeat_interval=1.0,
-                max_triggers=1,
+                max_triggers=2,
             ),
             event_log,
             worker_factory=lambda worker_config: next(workers),
@@ -559,6 +793,61 @@ def test_heartbeats_continue_during_recovery(monkeypatch, tmp_path, capsys):
 
     output = capsys.readouterr().out
     assert "heartbeat elapsed=1.000s attempted_triggers=1" in output
+
+
+def test_heartbeats_continue_while_reopen_call_is_blocked(
+    monkeypatch, tmp_path, capsys
+):
+    """Would catch a blocked replacement open suppressing progress heartbeats."""
+    clock = FakeClock()
+    failed_trigger = ScriptedWorker(
+        [
+            {
+                "ok": False,
+                "ready": False,
+                "error_code": "DPX_ERR_USB",
+                "error_string": "gone",
+                "device_time": None,
+                "emitted": False,
+                "outcome": "device_error",
+            }
+        ]
+    )
+
+    class ProgressOpenWorker(ScriptedWorker):
+        def start(self, timeout, progress_callback=None, **kwargs):
+            for now in (0.5, 1.0):
+                clock.now = now
+                if progress_callback is not None:
+                    progress_callback()
+            return super().start(timeout, **kwargs)
+
+    recovered = ProgressOpenWorker([successful_result()])
+    workers = iter([failed_trigger, recovered])
+    monkeypatch.setattr(soak.time, "monotonic", clock.monotonic)
+    with CsvEventLog(tmp_path / "run.csv") as event_log:
+        runner = SoakRunner(
+            SoakConfig(
+                interval=10,
+                reopen_interval=0,
+                call_timeout=20,
+                heartbeat_interval=0.5,
+                max_triggers=2,
+            ),
+            event_log,
+            worker_factory=lambda worker_config: next(workers),
+        )
+        runner.run()
+
+    heartbeats = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("heartbeat ")
+    ]
+    assert heartbeats == [
+        "heartbeat elapsed=0.500s attempted_triggers=1",
+        "heartbeat elapsed=1.000s attempted_triggers=1",
+    ]
 
 
 def test_cli_parser_has_required_defaults_and_accepts_every_soak_flag():
@@ -660,6 +949,101 @@ def test_simulated_cli_writes_three_sent_rows_and_clean_close(tmp_path):
     )
 
 
+def test_initial_open_hang_stops_at_duration_and_reports_heartbeats(tmp_path):
+    """Would catch a short finite run waiting for the longer open timeout."""
+    csv_path = tmp_path / "open-hang.csv"
+    started = time.monotonic()
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "harness.soak",
+            "--simulate",
+            "--simulate-fail-after-calls",
+            "0",
+            "--simulate-mode",
+            "hang",
+            "--call-timeout",
+            "2",
+            "--heartbeat-interval",
+            "0.05",
+            "--duration",
+            "0.25",
+            "--csv",
+            str(csv_path),
+            "--text-log",
+            str(tmp_path / "open-hang.log"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    elapsed = time.monotonic() - started
+
+    assert completed.returncode == 0, completed.stderr
+    assert elapsed < 1.5
+    assert "heartbeat " in completed.stdout
+    assert "failure outcome=open_exception" in completed.stdout
+
+
+def test_sigint_cancels_hung_close_before_long_call_timeout(tmp_path):
+    """Would catch SIGINT waiting for the full DPxClose call timeout."""
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "harness.soak",
+            "--simulate",
+            "--simulate-fail-after-calls",
+            "9",
+            "--simulate-mode",
+            "hang",
+            "--max-triggers",
+            "1",
+            "--duration",
+            "10",
+            "--call-timeout",
+            "10",
+            "--csv",
+            str(tmp_path / "close-hang.csv"),
+            "--text-log",
+            str(tmp_path / "close-hang.log"),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        csv_path = tmp_path / "close-hang.csv"
+        trigger_deadline = time.monotonic() + 5
+        while time.monotonic() < trigger_deadline:
+            if csv_path.exists() and trigger_rows(csv_path):
+                break
+            time.sleep(0.01)
+        else:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate(timeout=2)
+            pytest.fail("simulated trigger did not complete before close")
+        interrupted_at = time.monotonic()
+        process.send_signal(signal.SIGINT)
+        try:
+            stdout, stderr = process.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate(timeout=2)
+            pytest.fail("SIGINT did not cancel the hung close")
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate(timeout=2)
+
+    assert process.returncode == 0, stderr
+    assert time.monotonic() - interrupted_at < 1.5
+    assert "worker_close_failed" in marker_names(tmp_path / "close-hang.csv")
+
+
 def test_main_restores_previous_sigint_handler(tmp_path):
     csv_path = tmp_path / "signal.csv"
     text_path = tmp_path / "signal.log"
@@ -687,3 +1071,32 @@ def test_main_restores_previous_sigint_handler(tmp_path):
         assert signal.getsignal(signal.SIGINT) is sentinel_handler
     finally:
         signal.signal(signal.SIGINT, original)
+
+
+@pytest.mark.parametrize(
+    ("failure_flag", "value"),
+    [
+        ("--simulate-fail-after-calls", "100"),
+        ("--simulate-fail-after-seconds", "100"),
+    ],
+)
+def test_soak_cli_requires_duration_for_failure_injection(
+    failure_flag, value, tmp_path
+):
+    """Would catch advertising max-trigger finiteness during startup recovery."""
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "--simulate",
+                failure_flag,
+                value,
+                "--max-triggers",
+                "0",
+                "--csv",
+                str(tmp_path / "invalid.csv"),
+                "--text-log",
+                str(tmp_path / "invalid.log"),
+            ]
+        )
+
+    assert not (tmp_path / "invalid.csv").exists()

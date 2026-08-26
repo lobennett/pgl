@@ -628,6 +628,24 @@ def test_main_restores_sigint_handler_and_joins_soak_thread(tmp_path):
         signal.signal(signal.SIGINT, original)
 
 
+def test_provoke_keeps_max_trigger_only_failure_simulation_compatibility(tmp_path):
+    """Would catch soak-only CLI validation leaking into provoke workflows."""
+    assert main(
+        [
+            "--no-flush",
+            "--simulate",
+            "--simulate-fail-after-calls",
+            "100",
+            "--max-triggers",
+            "0",
+            "--csv",
+            str(tmp_path / "compatible.csv"),
+            "--text-log",
+            str(tmp_path / "compatible.log"),
+        ]
+    ) == 0
+
+
 @pytest.mark.parametrize(
     ("mode_args", "stdin", "expected_marker"),
     [
@@ -715,4 +733,11 @@ def test_sigint_stops_cli_and_closes_worker(tmp_path):
     process.send_signal(signal.SIGINT)
     stdout, stderr = process.communicate(timeout=5)
     assert process.returncode == 0, (stdout, stderr)
-    assert "worker_closed" in marker_names(csv_path)
+    markers = marker_names(csv_path)
+    assert any(
+        marker in {"worker_closed", "worker_close_failed", "open_failed"}
+        for marker in markers
+    )
+    assert not (
+        "worker_closed" in markers and "worker_close_failed" in markers
+    )

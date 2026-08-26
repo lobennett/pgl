@@ -39,7 +39,7 @@ Simulation can also exercise the recovery controller. This short run injects a m
 python3 -m harness.soak --simulate --simulate-fail-after-calls 7 --simulate-mode error --interval 0.05 --reopen-interval 0.05 --duration 0.5 --csv logs/simulated-recovery.csv --text-log logs/simulated-recovery.log
 ```
 
-`--simulate-mode hang` tests the call deadline and worker termination; `silent` tests a healthy-looking device that emits no mock pulse. Keep `--duration` or `--max-triggers` finite for either mode.
+`--simulate-mode hang` tests the call deadline and worker termination; `silent` tests a healthy-looking device that emits no mock pulse. The soak CLI requires `--duration` whenever `--simulate-fail-after-calls` or `--simulate-fail-after-seconds` is present. A maximum trigger count alone cannot bound a failure that prevents the first trigger, so it is not accepted as the only guard for injected failures. Programmatic runners remain duration- or stop-driven during initial recovery, and the provoke CLI keeps its existing finite-mode controls.
 
 ```bash
 python3 -m harness.soak --simulate --simulate-fail-after-calls 7 --simulate-mode hang --call-timeout 0.1 --reopen-interval 0.05 --duration 0.5 --csv logs/simulated-hang.csv
