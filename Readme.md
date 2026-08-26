@@ -1,5 +1,25 @@
 # PGL
 
+## USB failure harness
+
+Start with the KVM provocation. It is the easiest controlled intervention and
+records markers before and after the switch in the same CSV as the soak:
+
+```bash
+python3 -m harness.provoke --kvm --csv dpx-soak.csv
+```
+
+Exactly one provocation is required per run. The alternatives are `--power`,
+`--bandwidth --bandwidth-source /path/to/existing-large-file`,
+`--stale-handle`, `--no-flush`, and `--wiggle`. Bandwidth mode opens its source
+read-only and rewinds it at EOF; it never creates or modifies traffic files.
+
+For a short hardware-free check of the recommended path:
+
+```bash
+printf '\n\n' | python3 -m harness.provoke --kvm --simulate --max-triggers 3
+```
+
 ## Setup
 ### 1. Clone library
 ```bash
