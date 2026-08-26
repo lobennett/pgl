@@ -23,7 +23,7 @@ class WorkerCloseError(RuntimeError):
 
 
 class WorkerForcedTermination(WorkerCloseError):
-    """Raised when graceful close was acknowledged but the child did not exit."""
+    """Raised when the child must be terminated instead of closing gracefully."""
 
 
 class WorkerCancelled(WorkerProtocolError):
@@ -274,6 +274,7 @@ class DeviceWorker:
         self.config = config
         self._process = None
         self._connection = None
+        self._request_outstanding = False
 
     @property
     def is_alive(self):
@@ -339,6 +340,7 @@ class DeviceWorker:
         process = self._process
         self._connection = None
         self._process = None
+        self._request_outstanding = False
 
         seen = set()
         for candidate in (connection, *extra_connections):
@@ -374,11 +376,18 @@ class DeviceWorker:
             self._cleanup_resources(child)
             raise
         child.close()
-        return self._receive(
-            timeout,
-            cancel_event=cancel_event,
-            progress_callback=progress_callback,
-        )
+        self._request_outstanding = True
+        try:
+            reply = self._receive(
+                timeout,
+                cancel_event=cancel_event,
+                progress_callback=progress_callback,
+            )
+        except BaseException:
+            raise
+        else:
+            self._request_outstanding = False
+            return reply
 
     def trigger(
         self,
@@ -391,6 +400,8 @@ class DeviceWorker:
     ):
         if self._connection is None or not self.is_alive:
             raise WorkerProtocolError("worker is not running")
+        if self._request_outstanding:
+            raise WorkerProtocolError("worker request is already outstanding")
         max_code = (1 << self.config.num_bits) - 1
         if (
             not isinstance(code, int)
@@ -398,14 +409,21 @@ class DeviceWorker:
             or not 0 <= code <= max_code
         ):
             raise ValueError(f"code must be between 0 and {max_code}")
-        self._send(
-            {"command": "trigger", "code": code, "flush": flush}
-        )
-        return self._receive(
-            timeout,
-            cancel_event=cancel_event,
-            progress_callback=progress_callback,
-        )
+        self._request_outstanding = True
+        try:
+            self._send(
+                {"command": "trigger", "code": code, "flush": flush}
+            )
+            reply = self._receive(
+                timeout,
+                cancel_event=cancel_event,
+                progress_callback=progress_callback,
+            )
+        except BaseException:
+            raise
+        else:
+            self._request_outstanding = False
+            return reply
 
     def _wait_for_exit(
         self,
@@ -442,6 +460,11 @@ class DeviceWorker:
     ):
         if self._process is None:
             return
+        if self._request_outstanding:
+            self.terminate()
+            raise WorkerForcedTermination(
+                "outstanding worker request required forced termination"
+            )
         deadline = (
             None if timeout is None else time.monotonic() + max(0.0, timeout)
         )

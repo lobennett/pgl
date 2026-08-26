@@ -1044,6 +1044,78 @@ def test_sigint_cancels_hung_close_before_long_call_timeout(tmp_path):
     assert "worker_close_failed" in marker_names(tmp_path / "close-hang.csv")
 
 
+def test_sigint_cancels_hung_trigger_without_waiting_for_close(tmp_path):
+    """Would catch queueing DPxClose behind a trigger that is still hung."""
+    csv_path = tmp_path / "trigger-hang.csv"
+    text_path = tmp_path / "trigger-hang.log"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "harness.soak",
+            "--simulate",
+            "--simulate-fail-after-calls",
+            "5",
+            "--simulate-mode",
+            "hang",
+            "--interval",
+            "0",
+            "--duration",
+            "10",
+            "--call-timeout",
+            "10",
+            "--heartbeat-interval",
+            "0.05",
+            "--csv",
+            str(csv_path),
+            "--text-log",
+            str(text_path),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        trigger_deadline = time.monotonic() + 5
+        while time.monotonic() < trigger_deadline:
+            if text_path.exists() and "attempted_triggers=1" in text_path.read_text():
+                break
+            time.sleep(0.01)
+        else:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate(timeout=2)
+            pytest.fail("child did not enter the injected trigger hang")
+
+        assert trigger_rows(csv_path) == []
+        interrupted_at = time.monotonic()
+        process.send_signal(signal.SIGINT)
+        try:
+            stdout, stderr = process.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate(timeout=2)
+            pytest.fail("SIGINT waited behind the outstanding trigger")
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate(timeout=2)
+
+    assert process.returncode == 0, (stdout, stderr)
+    assert time.monotonic() - interrupted_at < 1.5
+    with pytest.raises(ProcessLookupError):
+        os.killpg(process.pid, 0)
+    rows = csv_rows(csv_path)
+    trigger = next(row for row in rows if row["row_type"] == "trigger")
+    assert trigger["error_code"] == "WorkerCancelled"
+    close_failure = next(
+        row for row in rows if row["marker"] == "worker_close_failed"
+    )
+    assert close_failure["error_code"] == "WorkerForcedTermination"
+    assert close_failure["outcome"] == "close_failed"
+    assert "outstanding worker request" in close_failure["error_string"]
+
+
 def test_main_restores_previous_sigint_handler(tmp_path):
     csv_path = tmp_path / "signal.csv"
     text_path = tmp_path / "signal.log"

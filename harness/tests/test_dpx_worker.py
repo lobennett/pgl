@@ -583,3 +583,98 @@ def test_close_wait_is_cancellable_and_cleans_process_resources():
     assert len(progress_calls) == 2
     assert worker._connection is None
     assert worker._process is None
+
+
+def test_close_forces_outstanding_request_without_sending_close_command():
+    """Would catch queueing close behind a child call that cannot read it."""
+    class NoCloseSendConnection:
+        closed = False
+
+        def send(self, command):
+            raise AssertionError(f"must not send behind outstanding call: {command}")
+
+        def close(self):
+            self.closed = True
+
+    class HungProcess:
+        def __init__(self):
+            self.alive = True
+            self._closed = False
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, timeout):
+            pass
+
+        def terminate(self):
+            self.alive = False
+
+        def kill(self):
+            self.alive = False
+
+        def close(self):
+            self._closed = True
+
+    worker = DeviceWorker(WorkerConfig(simulate=True, num_bits=1))
+    worker._connection = NoCloseSendConnection()
+    worker._process = HungProcess()
+    worker._request_outstanding = True
+
+    with pytest.raises(
+        dpx_worker.WorkerForcedTermination,
+        match="outstanding worker request",
+    ):
+        worker.close(timeout=10)
+
+    assert worker._connection is None
+    assert worker._process is None
+
+
+def test_trigger_rejects_reuse_while_previous_reply_is_outstanding():
+    """Would catch queueing a new trigger behind a cancelled call's stale reply."""
+    class RecordingConnection:
+        def __init__(self):
+            self.sent = []
+            self.closed = False
+
+        def send(self, command):
+            self.sent.append(command)
+
+        def poll(self, timeout):
+            return False
+
+        def close(self):
+            self.closed = True
+
+    class LiveProcess:
+        def __init__(self):
+            self.alive = True
+            self._closed = False
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, timeout):
+            pass
+
+        def terminate(self):
+            self.alive = False
+
+        def kill(self):
+            self.alive = False
+
+        def close(self):
+            self._closed = True
+
+    connection = RecordingConnection()
+    worker = DeviceWorker(WorkerConfig(simulate=True, num_bits=1))
+    worker._connection = connection
+    worker._process = LiveProcess()
+    worker._request_outstanding = True
+    try:
+        with pytest.raises(WorkerProtocolError, match="already outstanding"):
+            worker.trigger(1, timeout=0)
+        assert connection.sent == []
+    finally:
+        worker.terminate()

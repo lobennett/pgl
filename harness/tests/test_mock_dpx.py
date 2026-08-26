@@ -51,6 +51,20 @@ def test_schedule_emits_only_when_register_cache_is_written():
     assert emissions[0]["samples"] == [7, 7, 0]
 
 
+def test_ram_write_keeps_samples_in_one_compact_contiguous_blob():
+    """Would catch restoring one dictionary entry per 16-bit RAM sample."""
+    mock_dpx.configure()
+    mock_dpx.DPxOpen()
+    base_address = 8_000_000
+    samples = list(range(4096))
+
+    mock_dpx.DPxWriteRam(base_address, samples)
+
+    pending_ram = mock_dpx.get_mock_state()["pending_ram"]
+    assert list(pending_ram) == [base_address]
+    assert pending_ram[base_address] == samples
+
+
 def test_error_activates_after_exact_successful_call_count():
     """Would catch faulting before the configured successful call count."""
     mock_dpx.configure(fail_after_calls=2, error_code="DPX_ERR_TEST")

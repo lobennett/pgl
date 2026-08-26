@@ -18,8 +18,8 @@ class _MockState:
     opened_at: float | None = None
     error_code: str = "DPX_SUCCESS"
     error_string: str = "Success"
-    pending_ram: dict[int, int] = field(default_factory=dict)
-    committed_ram: dict[int, int] = field(default_factory=dict)
+    pending_ram: dict[int, list[int]] = field(default_factory=dict)
+    committed_ram: dict[int, list[int]] = field(default_factory=dict)
     pending_schedule: tuple[float, int, int, int] | None = None
     schedule_started: bool = False
     emissions: list[dict[str, object]] = field(default_factory=list)
@@ -216,6 +216,21 @@ def DPxUpdateRegCache():
     DPxWriteRegCache()
 
 
+def _read_ram_samples(ranges, address, length):
+    samples = []
+    for sample_address in range(address, address + length * 2, 2):
+        for start_address, values in reversed(ranges.items()):
+            byte_offset = sample_address - start_address
+            if byte_offset >= 0 and byte_offset % 2 == 0:
+                index = byte_offset // 2
+                if index < len(values):
+                    samples.append(values[index])
+                    break
+        else:
+            break
+    return samples
+
+
 def DPxWriteRegCache():
     if not _before_call("DPxWriteRegCache"):
         return
@@ -224,16 +239,19 @@ def DPxWriteRegCache():
             _state.pending_ram.clear()
             _state.schedule_started = False
             return
-        _state.committed_ram.update(_state.pending_ram)
+        for start_address, values in _state.pending_ram.items():
+            # Reinsert an overwritten range so reverse traversal below keeps
+            # the most recently committed write authoritative.
+            _state.committed_ram.pop(start_address, None)
+            _state.committed_ram[start_address] = values
         _state.pending_ram.clear()
         if _state.schedule_started and _state.pending_schedule is not None:
             _, rate, length, address = _state.pending_schedule
-            samples = []
-            for index in range(length):
-                sample_address = address + index * 2
-                if sample_address not in _state.committed_ram:
-                    break
-                samples.append(_state.committed_ram[sample_address])
+            samples = _read_ram_samples(
+                _state.committed_ram,
+                address,
+                length,
+            )
             _state.emissions.append(
                 {
                     "address": address,
@@ -250,8 +268,8 @@ def DPxWriteRam(address, values):
         return
     with _lock:
         start_address = int(address)
-        for index, value in enumerate(values):
-            _state.pending_ram[start_address + index * 2] = int(value)
+        _state.pending_ram.pop(start_address, None)
+        _state.pending_ram[start_address] = [int(value) for value in values]
 
 
 def DPxSetDoutSchedule(delay, rate, length, address):
