@@ -115,7 +115,7 @@ def run(
     finally:
         try:
             if task is not None:
-                task.closeDataPixxOnce()
+                task.end()
             elif data_pixx is not None:
                 data_pixx.closeDPx()
         finally:

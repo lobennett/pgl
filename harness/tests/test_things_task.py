@@ -252,6 +252,7 @@ def test_runner_task_end_closes_dpx_before_save_and_screen(
             events.append("preload_textures")
             self.data_pixx = data_pixx
             self.closed = False
+            self.ended = False
 
         def closeDataPixxOnce(self):
             if not self.closed:
@@ -259,8 +260,13 @@ def test_runner_task_end_closes_dpx_before_save_and_screen(
                 self.closed = True
 
         def end(self):
+            if self.ended:
+                return
             events.append("task_end")
-            self.closeDataPixxOnce()
+            try:
+                self.closeDataPixxOnce()
+            finally:
+                self.ended = True
 
     THINGS_TASK_MODULE.run(
         tmp_path,
@@ -347,6 +353,87 @@ def test_runner_construction_failure_uses_dpx_close_fallback_before_screen(tmp_p
         "end_screen:True",
         "physical_screen_close",
     ]
+
+
+@pytest.mark.parametrize("end_before_raise", [False, True])
+def test_runner_exception_ends_created_task_before_screen(
+    tmp_path, end_before_raise
+):
+    events = []
+
+    class FakePgl:
+        def devicesAdd(self, device):
+            events.append("add_device")
+
+    class FakeExperiment:
+        def __init__(self, **kwargs):
+            events.append("experiment")
+            self.settings = types.SimpleNamespace(closeScreenOnEnd=True)
+            self.task = None
+
+        def initScreen(self):
+            events.append("open_screen")
+
+        def addTask(self, task):
+            events.append("add_task")
+            self.task = task
+
+        def run(self):
+            events.append("run")
+            if end_before_raise:
+                self.task.end()
+            events.append("raise")
+            raise RuntimeError("run failed")
+
+        def endScreen(self):
+            events.append("physical_screen_close")
+
+    class FakeDataPixx:
+        isActive = True
+
+        def setupConditions(self, **kwargs):
+            events.append("configure_conditions")
+
+        def closeDPx(self):
+            events.append("close_dpx")
+
+    class LifecycleTask:
+        def __init__(self, pgl_instance, data_pixx, image_dir):
+            events.append("preload_textures")
+            self.data_pixx = data_pixx
+            self.closed = False
+            self.ended = False
+
+        def closeDataPixxOnce(self):
+            if not self.closed:
+                events.append("task_close_dpx")
+                self.data_pixx.closeDPx()
+                self.closed = True
+
+        def end(self):
+            if self.ended:
+                return
+            events.append("task_end")
+            try:
+                self.closeDataPixxOnce()
+            finally:
+                events.append("base_end")
+                self.ended = True
+
+    with pytest.raises(RuntimeError, match="run failed"):
+        THINGS_TASK_MODULE.run(
+            tmp_path,
+            pgl_factory=FakePgl,
+            experiment_factory=FakeExperiment,
+            datapixx_factory=FakeDataPixx,
+            task_factory=LifecycleTask,
+        )
+
+    assert events.count("task_end") == 1
+    assert events.count("base_end") == 1
+    assert events.count("task_close_dpx") == 1
+    assert events.count("close_dpx") == 1
+    assert events[-1] == "physical_screen_close"
 
 
 def test_minimal_runner_orders_pre_image_code_before_texture_creation(tmp_path):
