@@ -1,0 +1,36 @@
+{
+  "SPUSBDataType": [
+    {
+      "_name": "USB Controller",
+      "vendor_id": "0x05ac",
+      "product_id": "0x1234",
+      "location_id": "0x00100000",
+      "current_available": "500 mA",
+      "_items": [
+        {
+          "_name": "Hub",
+          "vendor_id": "0x2109",
+          "product_id": "0x2817",
+          "location_id": "0x00110000",
+          "current_required": "100 mA",
+          "_items": [
+            {
+              "_name": "Camera",
+              "vendor_id": "0x046d",
+              "product_id": "0x0825",
+              "location_id": "0x00112000",
+              "current_required": "100 mA"
+            },
+            {
+              "_name": "External SSD",
+              "vendor_id": "0x1058",
+              "product_id": "0x25a3",
+              "location_id": "0x00113000",
+              "current_required": "900 mA"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
