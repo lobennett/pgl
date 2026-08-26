@@ -12,7 +12,14 @@ class FakePglTask:
         self.pgl = pgl
         self.settings = types.SimpleNamespace()
         self.state = types.SimpleNamespace(currentTrial=0, currentSegment=0)
-        self.data = types.SimpleNamespace()
+        self.data = types.SimpleNamespace(endTime=None)
+        self.base_end_calls = 0
+
+    def end(self):
+        if self.data.endTime is not None:
+            return
+        self.base_end_calls += 1
+        self.data.endTime = 1.0
 
 
 def _load_things_task_with_fake_pgl():
@@ -92,9 +99,13 @@ class FakeRenderer:
 class FakeDataPixx:
     def __init__(self):
         self.conditions = []
+        self.close_calls = 0
 
     def writeCondition(self, condition):
         self.conditions.append(condition)
+
+    def closeDPx(self):
+        self.close_calls += 1
 
 
 @pytest.fixture
@@ -155,7 +166,6 @@ def test_update_screen_uses_preloaded_texture_without_decoding(
     monkeypatch.setattr(Image, "open", fail_if_created)
     monkeypatch.setattr(THINGS_TASK_MODULE.np, "asarray", fail_if_created)
     monkeypatch.setattr(preloaded_task.pgl, "imageCreate", fail_if_created)
-    preloaded_task.pgl.get = fail_if_created
     preloaded_task.state.currentTrial = 0
     preloaded_task.state.currentSegment = 0
     preloaded_task.updateScreen()
@@ -167,10 +177,35 @@ def test_update_screen_uses_preloaded_texture_without_decoding(
         (0, 0, 0.25, 0.25, [1, 1, 1]),
         (0, 0, 0.25, 0.25, [1, 1, 1]),
     ]
+    assert not hasattr(preloaded_task, "database")
 
 
-def test_runner_opens_screen_and_configures_conditions_before_preloading(tmp_path):
+def test_task_end_closes_dpx_once_and_preserves_base_end(preloaded_task):
+    preloaded_task.end()
+    preloaded_task.end()
+
+    assert preloaded_task.data_pixx.close_calls == 1
+    assert preloaded_task.base_end_calls == 1
+
+
+def test_task_end_runs_base_end_when_dpx_close_raises(preloaded_task):
+    def fail_close():
+        raise RuntimeError("DPx close failed")
+
+    preloaded_task.data_pixx.closeDPx = fail_close
+
+    with pytest.raises(RuntimeError, match="DPx close failed"):
+        preloaded_task.end()
+
+    assert preloaded_task.base_end_calls == 1
+
+
+@pytest.mark.parametrize("initial_close_screen", [True, False])
+def test_runner_task_end_closes_dpx_before_save_and_screen(
+    tmp_path, initial_close_screen
+):
     events = []
+    experiment_instances = []
 
     class FakePgl:
         def devicesAdd(self, device):
@@ -179,16 +214,21 @@ def test_runner_opens_screen_and_configures_conditions_before_preloading(tmp_pat
     class FakeExperiment:
         def __init__(self, **kwargs):
             events.append("experiment")
-            self.settings = types.SimpleNamespace(closeScreenOnEnd=True)
+            self.settings = types.SimpleNamespace(closeScreenOnEnd=initial_close_screen)
+            self.task = None
+            experiment_instances.append(self)
 
         def initScreen(self):
             events.append("open_screen")
 
         def addTask(self, task):
             events.append("add_task")
+            self.task = task
 
         def run(self):
             events.append("run")
+            self.task.end()
+            events.append("save")
             self.endScreen()
 
         def endScreen(self):
@@ -206,20 +246,31 @@ def test_runner_opens_screen_and_configures_conditions_before_preloading(tmp_pat
         def closeDPx(self):
             events.append("close_dpx")
 
-    class FakeTask:
+    class LifecycleTask:
         def __init__(self, pgl_instance, data_pixx, image_dir):
             assert events == ["experiment", "open_screen", "configure_conditions"]
             events.append("preload_textures")
+            self.data_pixx = data_pixx
+            self.closed = False
+
+        def closeDataPixxOnce(self):
+            if not self.closed:
+                self.data_pixx.closeDPx()
+                self.closed = True
+
+        def end(self):
+            events.append("task_end")
+            self.closeDataPixxOnce()
 
     THINGS_TASK_MODULE.run(
         tmp_path,
         pgl_factory=FakePgl,
         experiment_factory=FakeExperiment,
         datapixx_factory=FakeDataPixx,
-        task_factory=FakeTask,
+        task_factory=LifecycleTask,
     )
 
-    assert events == [
+    expected = [
         "experiment",
         "open_screen",
         "configure_conditions",
@@ -227,14 +278,18 @@ def test_runner_opens_screen_and_configures_conditions_before_preloading(tmp_pat
         "add_device",
         "add_task",
         "run",
-        "end_screen:False",
+        "task_end",
         "close_dpx",
-        "end_screen:True",
-        "physical_screen_close",
+        "save",
+        f"end_screen:{initial_close_screen}",
     ]
+    if initial_close_screen:
+        expected.append("physical_screen_close")
+    assert events == expected
+    assert experiment_instances[0].settings.closeScreenOnEnd is initial_close_screen
 
 
-def test_runner_exception_closes_dpx_before_the_physical_screen(tmp_path):
+def test_runner_construction_failure_uses_dpx_close_fallback_before_screen(tmp_path):
     events = []
 
     class FakePgl:
@@ -253,8 +308,7 @@ def test_runner_exception_closes_dpx_before_the_physical_screen(tmp_path):
             events.append("add_task")
 
         def run(self):
-            events.append(f"run:{self.settings.closeScreenOnEnd}")
-            raise RuntimeError("experiment run failed")
+            raise AssertionError("run should not be reached")
 
         def endScreen(self):
             events.append(f"end_screen:{self.settings.closeScreenOnEnd}")
@@ -270,17 +324,18 @@ def test_runner_exception_closes_dpx_before_the_physical_screen(tmp_path):
         def closeDPx(self):
             events.append("close_dpx")
 
-    class FakeTask:
+    class FailingTask:
         def __init__(self, pgl_instance, data_pixx, image_dir):
             events.append("preload_textures")
+            raise RuntimeError("texture preload failed")
 
-    with pytest.raises(RuntimeError, match="experiment run failed"):
+    with pytest.raises(RuntimeError, match="texture preload failed"):
         THINGS_TASK_MODULE.run(
             tmp_path,
             pgl_factory=FakePgl,
             experiment_factory=FakeExperiment,
             datapixx_factory=FakeDataPixx,
-            task_factory=FakeTask,
+            task_factory=FailingTask,
         )
 
     assert events == [
@@ -288,9 +343,6 @@ def test_runner_exception_closes_dpx_before_the_physical_screen(tmp_path):
         "open_screen",
         "configure_conditions",
         "preload_textures",
-        "add_device",
-        "add_task",
-        "run:False",
         "close_dpx",
         "end_screen:True",
         "physical_screen_close",
@@ -305,6 +357,9 @@ def test_minimal_runner_orders_pre_image_code_before_texture_creation(tmp_path):
             events.append(("display", kwargs))
 
     class FakePgl:
+        def __init__(self):
+            events.append("construct_pgl")
+
         def imageCreate(self, image_data):
             events.append("create_texture")
             return FakeTexture()
@@ -326,7 +381,9 @@ def test_minimal_runner_orders_pre_image_code_before_texture_creation(tmp_path):
             events.append("physical_screen_close")
 
     class FakeDataPixx:
-        isActive = True
+        def __init__(self):
+            events.append("construct_dpx")
+            self.isActive = True
 
         class dp:
             @staticmethod
@@ -374,8 +431,10 @@ def test_minimal_runner_orders_pre_image_code_before_texture_creation(tmp_path):
     )
 
     assert events == [
+        "construct_pgl",
         "experiment",
         "open_screen",
+        "construct_dpx",
         ("configure_conditions", {"numBits": 8, "pulseLen": 3}),
         "firmware",
         "pixel_mode",

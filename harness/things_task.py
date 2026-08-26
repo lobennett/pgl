@@ -27,6 +27,7 @@ class ThingsTask(pglTask):
     ):
         super().__init__(pgl_instance)
         self.data_pixx = data_pixx
+        self._data_pixx_closed = False
         self.image_height = image_height
 
         image_dir = Path(image_dir)
@@ -69,6 +70,18 @@ class ThingsTask(pglTask):
             self.textures[self.state.currentTrial].display(height=self.image_height)
         self.pgl.rect(0, 0, 0.25, 0.25, color=[1, 1, 1])
 
+    def closeDataPixxOnce(self):
+        if self._data_pixx_closed:
+            return
+        self.data_pixx.closeDPx()
+        self._data_pixx_closed = True
+
+    def end(self):
+        try:
+            self.closeDataPixxOnce()
+        finally:
+            super().end()
+
 
 def run(
     image_dir,
@@ -86,6 +99,8 @@ def run(
         subjectID="s0000",
     )
     data_pixx = None
+    task = None
+    run_completed = False
     try:
         experiment.initScreen()
         data_pixx = datapixx_factory()
@@ -95,15 +110,17 @@ def run(
         task = task_factory(pgl_instance, data_pixx, image_dir)
         pgl_instance.devicesAdd(data_pixx)
         experiment.addTask(task)
-        experiment.settings.closeScreenOnEnd = False
         experiment.run()
+        run_completed = True
     finally:
         try:
-            if data_pixx is not None:
+            if task is not None:
+                task.closeDataPixxOnce()
+            elif data_pixx is not None:
                 data_pixx.closeDPx()
         finally:
-            experiment.settings.closeScreenOnEnd = True
-            experiment.endScreen()
+            if not run_completed:
+                experiment.endScreen()
 
 
 def main():
