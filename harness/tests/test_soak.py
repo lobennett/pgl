@@ -90,6 +90,36 @@ def marker_names(path):
     ]
 
 
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+
+class AdvancingStopEvent:
+    def __init__(self, clock):
+        self.clock = clock
+        self.waits = []
+
+    def is_set(self):
+        return False
+
+    def wait(self, seconds):
+        self.waits.append(seconds)
+        self.clock.now += seconds
+        return False
+
+
+class InterruptingStopEvent(AdvancingStopEvent):
+    def wait(self, seconds):
+        self.waits.append(seconds)
+        if seconds > 0:
+            return True
+        return False
+
+
 def test_codes_cycle_without_zero(tmp_path):
     worker = ScriptedWorker([successful_result()] * 4)
     config = SoakConfig(interval=0, num_bits=2, max_triggers=4)
@@ -268,6 +298,152 @@ def test_trigger_waits_use_absolute_deadlines(monkeypatch, tmp_path):
     assert stop_event.waits == [0.0, 0.75, 0.75]
 
 
+def test_duration_caps_long_normal_interval_at_absolute_deadline(
+    monkeypatch, tmp_path
+):
+    clock = FakeClock()
+    stop_event = AdvancingStopEvent(clock)
+    worker = ScriptedWorker([successful_result()])
+    monkeypatch.setattr(soak.time, "monotonic", clock.monotonic)
+    with CsvEventLog(tmp_path / "run.csv") as event_log:
+        runner = SoakRunner(
+            SoakConfig(
+                interval=100,
+                heartbeat_interval=1000,
+                duration=1,
+            ),
+            event_log,
+            worker_factory=lambda worker_config: worker,
+        )
+        runner.stop_event = stop_event
+        runner.run()
+
+    assert clock.now == 1
+    assert stop_event.waits == [0.0, 1.0]
+    assert len(trigger_rows(tmp_path / "run.csv")) == 1
+
+
+def test_duration_caps_long_reopen_interval_without_reopen_attempt(
+    monkeypatch, tmp_path
+):
+    clock = FakeClock()
+    stop_event = AdvancingStopEvent(clock)
+    worker = ScriptedWorker([WorkerTimeout("trigger hung")])
+    monkeypatch.setattr(soak.time, "monotonic", clock.monotonic)
+    with CsvEventLog(tmp_path / "run.csv") as event_log:
+        runner = SoakRunner(
+            SoakConfig(
+                interval=100,
+                reopen_interval=100,
+                heartbeat_interval=1000,
+                duration=1,
+            ),
+            event_log,
+            worker_factory=lambda worker_config: worker,
+        )
+        runner.stop_event = stop_event
+        runner.run()
+
+    assert clock.now == 1
+    assert stop_event.waits == [0.0, 1.0]
+    assert len(trigger_rows(tmp_path / "run.csv")) == 1
+    assert [
+        name
+        for name in marker_names(tmp_path / "run.csv")
+        if name.startswith("reopen_")
+    ] == []
+
+
+def test_heartbeats_fire_at_each_deadline_during_long_normal_wait(
+    monkeypatch, tmp_path, capsys
+):
+    clock = FakeClock()
+    stop_event = AdvancingStopEvent(clock)
+    worker = ScriptedWorker([successful_result()])
+    monkeypatch.setattr(soak.time, "monotonic", clock.monotonic)
+    with CsvEventLog(tmp_path / "run.csv") as event_log:
+        runner = SoakRunner(
+            SoakConfig(interval=10, heartbeat_interval=1, duration=3.5),
+            event_log,
+            worker_factory=lambda worker_config: worker,
+        )
+        runner.stop_event = stop_event
+        runner.run()
+
+    heartbeats = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("heartbeat ")
+    ]
+    assert heartbeats == [
+        "heartbeat elapsed=1.000s attempted_triggers=1",
+        "heartbeat elapsed=2.000s attempted_triggers=1",
+        "heartbeat elapsed=3.000s attempted_triggers=1",
+    ]
+    assert clock.now == 3.5
+    assert len(trigger_rows(tmp_path / "run.csv")) == 1
+
+
+def test_heartbeats_fire_at_each_deadline_during_long_reopen_wait(
+    monkeypatch, tmp_path, capsys
+):
+    clock = FakeClock()
+    stop_event = AdvancingStopEvent(clock)
+    worker = ScriptedWorker([WorkerTimeout("trigger hung")])
+    monkeypatch.setattr(soak.time, "monotonic", clock.monotonic)
+    with CsvEventLog(tmp_path / "run.csv") as event_log:
+        runner = SoakRunner(
+            SoakConfig(
+                interval=10,
+                reopen_interval=10,
+                heartbeat_interval=1,
+                duration=3.5,
+            ),
+            event_log,
+            worker_factory=lambda worker_config: worker,
+        )
+        runner.stop_event = stop_event
+        runner.run()
+
+    heartbeats = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("heartbeat ")
+    ]
+    assert heartbeats == [
+        "heartbeat elapsed=1.000s attempted_triggers=1",
+        "heartbeat elapsed=2.000s attempted_triggers=1",
+        "heartbeat elapsed=3.000s attempted_triggers=1",
+    ]
+    assert clock.now == 3.5
+    assert [
+        name
+        for name in marker_names(tmp_path / "run.csv")
+        if name.startswith("reopen_")
+    ] == []
+
+
+def test_stop_event_interrupts_deadline_wait_without_more_work(
+    monkeypatch, tmp_path
+):
+    clock = FakeClock()
+    stop_event = InterruptingStopEvent(clock)
+    worker = ScriptedWorker([successful_result()])
+    monkeypatch.setattr(soak.time, "monotonic", clock.monotonic)
+    with CsvEventLog(tmp_path / "run.csv") as event_log:
+        runner = SoakRunner(
+            SoakConfig(interval=10, heartbeat_interval=1, duration=20),
+            event_log,
+            worker_factory=lambda worker_config: worker,
+        )
+        runner.stop_event = stop_event
+        runner.run()
+
+    assert stop_event.waits == [0.0, 1.0]
+    assert clock.now == 0
+    assert len(trigger_rows(tmp_path / "run.csv")) == 1
+
+
 def test_heartbeats_print_and_append_attempt_count(tmp_path, capsys):
     text_log = tmp_path / "run.log"
     worker = ScriptedWorker([successful_result()] * 2)
@@ -382,7 +558,7 @@ def test_heartbeats_continue_during_recovery(monkeypatch, tmp_path, capsys):
         runner.run()
 
     output = capsys.readouterr().out
-    assert "heartbeat elapsed=1.200s attempted_triggers=1" in output
+    assert "heartbeat elapsed=1.000s attempted_triggers=1" in output
 
 
 def test_cli_parser_has_required_defaults_and_accepts_every_soak_flag():

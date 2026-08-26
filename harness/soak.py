@@ -81,6 +81,7 @@ class SoakRunner:
         self.worker = None
         self.sequence_number = 0
         self._started_at = None
+        self._duration_deadline = None
         self._next_heartbeat = None
 
     def _emit_text(self, message):
@@ -110,7 +111,10 @@ class SoakRunner:
             f"heartbeat elapsed={now - self._started_at:.3f}s "
             f"attempted_triggers={self.sequence_number}"
         )
-        self._next_heartbeat = now + self.config.heartbeat_interval
+        if self.config.heartbeat_interval > 0:
+            self._next_heartbeat += self.config.heartbeat_interval
+        else:
+            self._next_heartbeat = now
 
     def _worker_config(self):
         simulation = {
@@ -127,11 +131,42 @@ class SoakRunner:
             sampling_rate=self.config.sampling_rate,
         )
 
-    def _duration_reached(self):
-        return (
-            self.config.duration is not None
-            and time.monotonic() - self._started_at >= self.config.duration
-        )
+    def _duration_reached(self, now=None):
+        if self._duration_deadline is None:
+            return False
+        if now is None:
+            now = time.monotonic()
+        return now >= self._duration_deadline
+
+    def _wait_until(self, operation_deadline):
+        while True:
+            if self.stop_event.is_set():
+                return False
+            now = time.monotonic()
+            if self._duration_reached(now):
+                return False
+            if now >= operation_deadline:
+                return not self.stop_event.wait(0)
+
+            wake_deadlines = [operation_deadline]
+            if self._duration_deadline is not None:
+                wake_deadlines.append(self._duration_deadline)
+            if self.config.heartbeat_interval > 0:
+                wake_deadlines.append(self._next_heartbeat)
+            wake_deadline = min(wake_deadlines)
+            if self.stop_event.wait(max(0.0, wake_deadline - now)):
+                return False
+
+            now = time.monotonic()
+            if self._duration_reached(now):
+                return False
+            if now >= operation_deadline:
+                return True
+            if (
+                self.config.heartbeat_interval > 0
+                and now >= self._next_heartbeat
+            ):
+                self._maybe_heartbeat()
 
     def _run_limit_reached(self):
         return (
@@ -196,9 +231,9 @@ class SoakRunner:
             self.worker = None
 
         while not self.stop_event.is_set() and not self._duration_reached():
-            if self.stop_event.wait(self.config.reopen_interval):
+            reopen_deadline = time.monotonic() + self.config.reopen_interval
+            if not self._wait_until(reopen_deadline):
                 return False
-            self._maybe_heartbeat()
             self.event_log.write_marker("reopen_attempt")
             candidate = None
             try:
@@ -257,6 +292,11 @@ class SoakRunner:
 
     def run(self):
         self._started_at = time.monotonic()
+        self._duration_deadline = (
+            self._started_at + self.config.duration
+            if self.config.duration is not None
+            else None
+        )
         self._next_heartbeat = (
             self._started_at + self.config.heartbeat_interval
         )
@@ -282,10 +322,7 @@ class SoakRunner:
                     return
 
             while not self.stop_event.is_set() and not self._run_limit_reached():
-                delay = max(0.0, next_trigger - time.monotonic())
-                if self.stop_event.wait(delay):
-                    break
-                if self._duration_reached():
+                if not self._wait_until(next_trigger):
                     break
 
                 self.sequence_number += 1
