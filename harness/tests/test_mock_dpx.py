@@ -1,5 +1,7 @@
 import threading
 
+import pytest
+
 from harness import mock_dpx
 
 
@@ -60,6 +62,14 @@ def test_error_activates_after_exact_successful_call_count():
     assert mock_dpx.DPxGetError() == "DPX_ERR_TEST"
 
 
+def test_duplicate_open_preserves_latched_injected_error():
+    """Would catch duplicate opening overwriting the latched USB failure."""
+    mock_dpx.configure(fail_after_calls=0, error_code="DPX_ERR_TEST")
+    mock_dpx.DPxOpen()
+    mock_dpx.DPxOpen()
+    assert mock_dpx.DPxGetError() == "DPX_ERR_TEST"
+
+
 def test_elapsed_time_failure_can_start_immediately():
     """Would catch ignoring an elapsed-time threshold of zero seconds."""
     mock_dpx.configure(fail_after_seconds=0, error_code="DPX_ERR_TIMEOUT")
@@ -80,16 +90,51 @@ def test_readiness_does_not_count_toward_failure_threshold():
 
 
 def test_hang_blocks_until_test_releases_it():
-    """Would catch a hang fault that returns before a test releases it."""
+    """Would catch releasing a hang before the hardware call reaches its wait."""
     mock_dpx.configure(fail_after_calls=0, failure_mode="hang")
     mock_dpx.DPxOpen()
     thread = threading.Thread(target=mock_dpx.DPxUpdateRegCache, daemon=True)
     thread.start()
-    thread.join(0.05)
-    assert thread.is_alive()
-    mock_dpx.release_hang()
-    thread.join(0.5)
+    try:
+        assert mock_dpx._hang_entered.wait(0.5)
+        assert thread.is_alive()
+    finally:
+        mock_dpx.release_hang()
+        thread.join(0.5)
     assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("hung_operation", ["open", "close"])
+def test_diagnostics_and_reset_remain_responsive_while_open_or_close_hangs(
+    hung_operation,
+):
+    """Would catch retaining the mock lock while an open or close waits."""
+    mock_dpx.configure(fail_after_calls=0, failure_mode="hang")
+    mock_dpx.DPxOpen()
+    operation = mock_dpx.DPxOpen if hung_operation == "open" else mock_dpx.DPxClose
+    hung_thread = threading.Thread(target=operation, daemon=True)
+    hung_thread.start()
+    assert mock_dpx._hang_entered.wait(0.5)
+
+    snapshots = []
+    inspect_thread = threading.Thread(
+        target=lambda: snapshots.append(mock_dpx.get_mock_state()), daemon=True
+    )
+    reset_thread = threading.Thread(target=mock_dpx.reset_mock, daemon=True)
+    inspect_thread.start()
+    reset_thread.start()
+    try:
+        inspect_thread.join(0.1)
+        reset_thread.join(0.1)
+        assert not inspect_thread.is_alive()
+        assert not reset_thread.is_alive()
+        assert snapshots
+    finally:
+        mock_dpx.release_hang()
+        hung_thread.join(0.5)
+        inspect_thread.join(0.5)
+        reset_thread.join(0.5)
+    assert not hung_thread.is_alive()
 
 
 def test_silent_failure_keeps_success_and_drops_emission():

@@ -39,6 +39,7 @@ class _MockState:
 
 
 _lock = RLock()
+_hang_entered = Event()
 _hang_released = Event()
 _state = _MockState()
 
@@ -101,6 +102,7 @@ def get_mock_state() -> dict:
             "call_count": _state.call_count,
             "fault_latched": _state.fault_latched,
             "commits_dropped": _state.commits_dropped,
+            "hang_entered": _hang_entered.is_set(),
             "persistent_handle_path": _state.persistent_handle_path,
             "owns_persistent_handle": _state.owns_persistent_handle,
         }
@@ -135,7 +137,11 @@ def _before_call(_name: str) -> None:
                 return
         should_hang = _state.failure_mode == "hang"
     if should_hang:
-        _hang_released.wait()
+        _hang_entered.set()
+        try:
+            _hang_released.wait()
+        finally:
+            _hang_entered.clear()
 
 
 def _set_error(code: str, message: str) -> None:
@@ -144,8 +150,10 @@ def _set_error(code: str, message: str) -> None:
 
 
 def DPxOpen():
+    _before_call("DPxOpen")
     with _lock:
-        _before_call("DPxOpen")
+        if _state.fault_latched and _state.failure_mode == "error":
+            return
         marker = _state.persistent_handle_path
         if _state.opened:
             _set_error("DPX_ERR_ALREADY_OPEN", "DATAPixx connection is already open")
@@ -164,8 +172,8 @@ def DPxOpen():
 
 
 def DPxClose():
+    _before_call("DPxClose")
     with _lock:
-        _before_call("DPxClose")
         if _state.owns_persistent_handle and _state.persistent_handle_path is not None:
             try:
                 _state.persistent_handle_path.unlink()
