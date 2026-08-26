@@ -31,6 +31,8 @@ class _MockState:
     failure_mode: str = "error"
     configured_error_code: str = "DPX_ERR_USB"
     configured_error_string: str = "Simulated USB failure"
+    fault_latched: bool = False
+    commits_dropped: bool = False
     pixel_mode: bool = False
     din_logging: bool = False
     dout_buffer: tuple[int, int] | None = None
@@ -97,14 +99,43 @@ def get_mock_state() -> dict:
             "schedule_started": _state.schedule_started,
             "emissions": [emission.copy() for emission in _state.emissions],
             "call_count": _state.call_count,
+            "fault_latched": _state.fault_latched,
+            "commits_dropped": _state.commits_dropped,
             "persistent_handle_path": _state.persistent_handle_path,
             "owns_persistent_handle": _state.owns_persistent_handle,
         }
 
 
+def _threshold_reached(state, now):
+    calls_reached = (
+        state.fail_after_calls is not None
+        and state.call_count >= state.fail_after_calls
+    )
+    time_reached = (
+        state.fail_after_seconds is not None
+        and state.opened_at is not None
+        and now - state.opened_at >= state.fail_after_seconds
+    )
+    return calls_reached or time_reached
+
+
 def _before_call(_name: str) -> None:
     with _lock:
-        _state.call_count += 1
+        if _name == "DPxIsReady" or not _state.opened:
+            return
+        if not _state.fault_latched:
+            if _threshold_reached(_state, time.monotonic()):
+                _state.fault_latched = True
+                if _state.failure_mode == "error":
+                    _set_error(_state.configured_error_code, _state.configured_error_string)
+                elif _state.failure_mode == "silent":
+                    _state.commits_dropped = True
+            else:
+                _state.call_count += 1
+                return
+        should_hang = _state.failure_mode == "hang"
+    if should_hang:
+        _hang_released.wait()
 
 
 def _set_error(code: str, message: str) -> None:
@@ -163,7 +194,8 @@ def DPxGetErrorString():
 
 def DPxClearError():
     with _lock:
-        _set_error("DPX_SUCCESS", "Success")
+        if not (_state.fault_latched and _state.failure_mode == "error"):
+            _set_error("DPX_SUCCESS", "Success")
 
 
 def DPxUpdateRegCache():
@@ -173,6 +205,10 @@ def DPxUpdateRegCache():
 def DPxWriteRegCache():
     _before_call("DPxWriteRegCache")
     with _lock:
+        if _state.commits_dropped:
+            _state.pending_ram.clear()
+            _state.schedule_started = False
+            return
         _state.committed_ram.update(
             {address: values.copy() for address, values in _state.pending_ram.items()}
         )

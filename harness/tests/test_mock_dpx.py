@@ -1,3 +1,5 @@
+import threading
+
 from harness import mock_dpx
 
 
@@ -45,3 +47,59 @@ def test_schedule_emits_only_when_register_cache_is_written():
     emissions = mock_dpx.get_mock_state()["emissions"]
     assert len(emissions) == 1
     assert emissions[0]["samples"] == [7, 7, 0]
+
+
+def test_error_activates_after_exact_successful_call_count():
+    """Would catch faulting before the configured successful call count."""
+    mock_dpx.configure(fail_after_calls=2, error_code="DPX_ERR_TEST")
+    mock_dpx.DPxOpen()
+    assert mock_dpx.DPxGetFirmwareRev() == 42
+    mock_dpx.DPxUpdateRegCache()
+    assert mock_dpx.DPxGetError() == "DPX_SUCCESS"
+    mock_dpx.DPxWriteRam(0, [1, 0])
+    assert mock_dpx.DPxGetError() == "DPX_ERR_TEST"
+
+
+def test_elapsed_time_failure_can_start_immediately():
+    """Would catch ignoring an elapsed-time threshold of zero seconds."""
+    mock_dpx.configure(fail_after_seconds=0, error_code="DPX_ERR_TIMEOUT")
+    mock_dpx.DPxOpen()
+    mock_dpx.DPxUpdateRegCache()
+    assert mock_dpx.DPxGetError() == "DPX_ERR_TIMEOUT"
+
+
+def test_readiness_does_not_count_toward_failure_threshold():
+    """Would catch a diagnostic readiness read consuming a hardware call."""
+    mock_dpx.configure(fail_after_calls=1, error_code="DPX_ERR_TEST")
+    mock_dpx.DPxOpen()
+    assert mock_dpx.DPxIsReady() is True
+    assert mock_dpx.DPxGetFirmwareRev() == 42
+    assert mock_dpx.DPxGetError() == "DPX_SUCCESS"
+    mock_dpx.DPxWriteRam(0, [1, 0])
+    assert mock_dpx.DPxGetError() == "DPX_ERR_TEST"
+
+
+def test_hang_blocks_until_test_releases_it():
+    """Would catch a hang fault that returns before a test releases it."""
+    mock_dpx.configure(fail_after_calls=0, failure_mode="hang")
+    mock_dpx.DPxOpen()
+    thread = threading.Thread(target=mock_dpx.DPxUpdateRegCache, daemon=True)
+    thread.start()
+    thread.join(0.05)
+    assert thread.is_alive()
+    mock_dpx.release_hang()
+    thread.join(0.5)
+    assert not thread.is_alive()
+
+
+def test_silent_failure_keeps_success_and_drops_emission():
+    """Would catch a silent USB fault that still commits an emission."""
+    mock_dpx.configure(fail_after_calls=0, failure_mode="silent")
+    mock_dpx.DPxOpen()
+    mock_dpx.DPxWriteRam(0, [9, 0])
+    mock_dpx.DPxSetDoutSchedule(0.0, 1000, 2, 0)
+    mock_dpx.DPxStartDoutSched()
+    mock_dpx.DPxWriteRegCache()
+    assert mock_dpx.DPxGetError() == "DPX_SUCCESS"
+    assert mock_dpx.DPxIsReady() is True
+    assert mock_dpx.get_mock_state()["emissions"] == []
