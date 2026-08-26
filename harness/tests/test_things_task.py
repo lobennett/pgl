@@ -24,7 +24,7 @@ def _load_things_task_with_fake_pgl():
     previous = sys.modules.get("pgl")
     sys.modules["pgl"] = fake_pgl
     try:
-        module_path = Path("harness/things_task.py")
+        module_path = Path(__file__).resolve().parents[1] / "things_task.py"
         spec = importlib.util.spec_from_file_location("task7_things_task", module_path)
         module = importlib.util.module_from_spec(spec)
         assert spec.loader is not None
@@ -39,6 +39,30 @@ def _load_things_task_with_fake_pgl():
 
 THINGS_TASK_MODULE = _load_things_task_with_fake_pgl()
 ThingsTask = THINGS_TASK_MODULE.ThingsTask
+
+
+def _load_minimal_experiment_with_fake_pgl():
+    fake_pgl = types.ModuleType("pgl")
+    fake_pgl.pgl = object
+    fake_pgl.pglDataPixx = object
+    fake_pgl.pglExperiment = object
+    previous = sys.modules.get("pgl")
+    sys.modules["pgl"] = fake_pgl
+    try:
+        module_path = Path(__file__).resolve().parents[1] / "minimal_experiment.py"
+        spec = importlib.util.spec_from_file_location("task7_minimal_experiment", module_path)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        if previous is None:
+            del sys.modules["pgl"]
+        else:
+            sys.modules["pgl"] = previous
+
+
+MINIMAL_EXPERIMENT_MODULE = _load_minimal_experiment_with_fake_pgl()
 
 
 class FakeTexture:
@@ -125,10 +149,13 @@ def test_fixation_segment_does_not_send_trigger(preloaded_task):
 def test_update_screen_uses_preloaded_texture_without_decoding(
     preloaded_task, monkeypatch
 ):
-    def fail_if_opened(*args, **kwargs):
-        raise AssertionError("image decoding occurred during updateScreen")
+    def fail_if_created(*args, **kwargs):
+        raise AssertionError("image decoding or creation occurred during updateScreen")
 
-    monkeypatch.setattr(Image, "open", fail_if_opened)
+    monkeypatch.setattr(Image, "open", fail_if_created)
+    monkeypatch.setattr(THINGS_TASK_MODULE.np, "asarray", fail_if_created)
+    monkeypatch.setattr(preloaded_task.pgl, "imageCreate", fail_if_created)
+    preloaded_task.pgl.get = fail_if_created
     preloaded_task.state.currentTrial = 0
     preloaded_task.state.currentSegment = 0
     preloaded_task.updateScreen()
@@ -152,6 +179,7 @@ def test_runner_opens_screen_and_configures_conditions_before_preloading(tmp_pat
     class FakeExperiment:
         def __init__(self, **kwargs):
             events.append("experiment")
+            self.settings = types.SimpleNamespace(closeScreenOnEnd=True)
 
         def initScreen(self):
             events.append("open_screen")
@@ -161,9 +189,12 @@ def test_runner_opens_screen_and_configures_conditions_before_preloading(tmp_pat
 
         def run(self):
             events.append("run")
+            self.endScreen()
 
         def endScreen(self):
-            events.append("close_screen")
+            events.append(f"end_screen:{self.settings.closeScreenOnEnd}")
+            if self.settings.closeScreenOnEnd:
+                events.append("physical_screen_close")
 
     class FakeDataPixx:
         isActive = True
@@ -196,6 +227,233 @@ def test_runner_opens_screen_and_configures_conditions_before_preloading(tmp_pat
         "add_device",
         "add_task",
         "run",
+        "end_screen:False",
         "close_dpx",
-        "close_screen",
+        "end_screen:True",
+        "physical_screen_close",
     ]
+
+
+def test_runner_exception_closes_dpx_before_the_physical_screen(tmp_path):
+    events = []
+
+    class FakePgl:
+        def devicesAdd(self, device):
+            events.append("add_device")
+
+    class FakeExperiment:
+        def __init__(self, **kwargs):
+            events.append("experiment")
+            self.settings = types.SimpleNamespace(closeScreenOnEnd=True)
+
+        def initScreen(self):
+            events.append("open_screen")
+
+        def addTask(self, task):
+            events.append("add_task")
+
+        def run(self):
+            events.append(f"run:{self.settings.closeScreenOnEnd}")
+            raise RuntimeError("experiment run failed")
+
+        def endScreen(self):
+            events.append(f"end_screen:{self.settings.closeScreenOnEnd}")
+            if self.settings.closeScreenOnEnd:
+                events.append("physical_screen_close")
+
+    class FakeDataPixx:
+        isActive = True
+
+        def setupConditions(self, **kwargs):
+            events.append("configure_conditions")
+
+        def closeDPx(self):
+            events.append("close_dpx")
+
+    class FakeTask:
+        def __init__(self, pgl_instance, data_pixx, image_dir):
+            events.append("preload_textures")
+
+    with pytest.raises(RuntimeError, match="experiment run failed"):
+        THINGS_TASK_MODULE.run(
+            tmp_path,
+            pgl_factory=FakePgl,
+            experiment_factory=FakeExperiment,
+            datapixx_factory=FakeDataPixx,
+            task_factory=FakeTask,
+        )
+
+    assert events == [
+        "experiment",
+        "open_screen",
+        "configure_conditions",
+        "preload_textures",
+        "add_device",
+        "add_task",
+        "run:False",
+        "close_dpx",
+        "end_screen:True",
+        "physical_screen_close",
+    ]
+
+
+def test_minimal_runner_orders_pre_image_code_before_texture_creation(tmp_path):
+    events = []
+
+    class FakeTexture:
+        def display(self, **kwargs):
+            events.append(("display", kwargs))
+
+    class FakePgl:
+        def imageCreate(self, image_data):
+            events.append("create_texture")
+            return FakeTexture()
+
+        def flush(self):
+            events.append("flush")
+
+        def waitSecs(self, seconds):
+            events.append(("wait", seconds))
+
+    class FakeExperiment:
+        def __init__(self, **kwargs):
+            events.append("experiment")
+
+        def initScreen(self):
+            events.append("open_screen")
+
+        def endScreen(self):
+            events.append("physical_screen_close")
+
+    class FakeDataPixx:
+        isActive = True
+
+        class dp:
+            @staticmethod
+            def DPxGetFirmwareRev():
+                events.append("firmware")
+                return 42
+
+            @staticmethod
+            def DPxIsDoutPixelMode():
+                events.append("pixel_mode")
+                return False
+
+        def setupConditions(self, **kwargs):
+            events.append(("configure_conditions", kwargs))
+
+        def writeCondition(self, code):
+            events.append(("condition", code))
+
+        def closeDPx(self):
+            events.append("close_dpx")
+
+    class FakeImage:
+        def __enter__(self):
+            events.append("open_image")
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def convert(self, mode):
+            events.append(("convert", mode))
+            return self
+
+        def copy(self):
+            events.append("copy")
+            return "image-copy"
+
+    MINIMAL_EXPERIMENT_MODULE.run(
+        tmp_path / "image.png",
+        pgl_factory=FakePgl,
+        experiment_factory=FakeExperiment,
+        datapixx_factory=FakeDataPixx,
+        image_open=lambda path: FakeImage(),
+        asarray=lambda image: events.append("asarray") or image,
+    )
+
+    assert events == [
+        "experiment",
+        "open_screen",
+        ("configure_conditions", {"numBits": 8, "pulseLen": 3}),
+        "firmware",
+        "pixel_mode",
+        ("condition", 17),
+        "open_image",
+        ("convert", "RGB"),
+        "copy",
+        "asarray",
+        "create_texture",
+        ("display", {"height": 18}),
+        "flush",
+        ("wait", 0.5),
+        ("condition", 18),
+        "close_dpx",
+        "physical_screen_close",
+    ]
+
+
+def test_minimal_runner_closes_dpx_before_screen_after_failure(tmp_path):
+    events = []
+
+    class FakePgl:
+        def imageCreate(self, image_data):
+            events.append("create_texture")
+            raise RuntimeError("texture creation failed")
+
+    class FakeExperiment:
+        def __init__(self, **kwargs):
+            events.append("experiment")
+
+        def initScreen(self):
+            events.append("open_screen")
+
+        def endScreen(self):
+            events.append("physical_screen_close")
+
+    class FakeDataPixx:
+        isActive = True
+
+        class dp:
+            @staticmethod
+            def DPxGetFirmwareRev():
+                return 42
+
+            @staticmethod
+            def DPxIsDoutPixelMode():
+                return False
+
+        def setupConditions(self, **kwargs):
+            events.append("configure_conditions")
+
+        def writeCondition(self, code):
+            events.append(("condition", code))
+
+        def closeDPx(self):
+            events.append("close_dpx")
+
+    class FakeImage:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def convert(self, mode):
+            return self
+
+        def copy(self):
+            return "image-copy"
+
+    with pytest.raises(RuntimeError, match="texture creation failed"):
+        MINIMAL_EXPERIMENT_MODULE.run(
+            tmp_path / "image.png",
+            pgl_factory=FakePgl,
+            experiment_factory=FakeExperiment,
+            datapixx_factory=FakeDataPixx,
+            image_open=lambda path: FakeImage(),
+            asarray=lambda image: image,
+        )
+
+    assert events[-2:] == ["close_dpx", "physical_screen_close"]

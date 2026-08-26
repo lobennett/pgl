@@ -11,7 +11,15 @@ from PIL import Image
 from pgl import pgl, pglDataPixx, pglExperiment
 
 
-def run(image_path):
+def run(
+    image_path,
+    *,
+    pgl_factory=pgl,
+    experiment_factory=pglExperiment,
+    datapixx_factory=pglDataPixx,
+    image_open=Image.open,
+    asarray=np.asarray,
+):
     """Run the strict six-step hardware check; do not invoke in automated tests."""
     pgl_instance = None
     experiment = None
@@ -19,15 +27,15 @@ def run(image_path):
     texture = None
     try:
         # 1. Open Metal before making a texture.
-        pgl_instance = pgl()
-        experiment = pglExperiment(
+        pgl_instance = pgl_factory()
+        experiment = experiment_factory(
             pgl=pgl_instance,
             experimentName="usbFailureMinimal",
             subjectID="s0000",
         )
         experiment.initScreen()
         # 2. Construct and verify the DATAPixx connection.
-        data_pixx = pglDataPixx()
+        data_pixx = datapixx_factory()
         if not data_pixx.isActive:
             raise RuntimeError("DATAPixx is not active")
         # 3. Preload the eight-bit trigger condition table and query device state.
@@ -37,8 +45,8 @@ def run(image_path):
         # 4. Send the known pre-image condition.
         data_pixx.writeCondition(17)
         # 5. Create, display, flush, and retain one texture for 500 ms.
-        with Image.open(image_path) as image:
-            image_data = np.asarray(image.convert("RGB").copy())
+        with image_open(image_path) as image:
+            image_data = asarray(image.convert("RGB").copy())
         texture = pgl_instance.imageCreate(image_data)
         if texture is None:
             raise RuntimeError(f"Could not create texture for {image_path}")

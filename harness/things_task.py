@@ -95,12 +95,14 @@ def run(
         task = task_factory(pgl_instance, data_pixx, image_dir)
         pgl_instance.devicesAdd(data_pixx)
         experiment.addTask(task)
+        experiment.settings.closeScreenOnEnd = False
         experiment.run()
     finally:
         try:
             if data_pixx is not None:
                 data_pixx.closeDPx()
         finally:
+            experiment.settings.closeScreenOnEnd = True
             experiment.endScreen()
 
 
