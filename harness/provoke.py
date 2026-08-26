@@ -170,9 +170,24 @@ def _stale_handle_child(connection, simulate, persistent_handle_path):
         os._exit(exit_code)
 
 
+def _warn_hardware_only(event_log, marker, action):
+    message = (
+        f"HARDWARE-ONLY: {action} will access a physical DATAPixx; "
+        "this is not electrical verification."
+    )
+    print(message, flush=True)
+    event_log.write_marker(marker, message, outcome="hardware_only")
+
+
 def run_stale_handle_probe(
     *, simulate, persistent_handle_path, event_log, timeout
 ):
+    if not simulate:
+        _warn_hardware_only(
+            event_log,
+            "hardware_only_stale_handle_helper",
+            "the stale-handle helper",
+        )
     context = multiprocessing.get_context("spawn")
     parent, child = context.Pipe(duplex=True)
     process = context.Process(
@@ -224,12 +239,44 @@ def run_stale_handle_probe(
         if simulate
         else {}
     )
+    if not simulate:
+        _warn_hardware_only(
+            event_log,
+            "hardware_only_stale_handle_reopen",
+            "the stale-handle reopen probe",
+        )
     worker = DeviceWorker(
         WorkerConfig(simulate=simulate, simulation=simulation)
     )
     try:
         result = worker.start(timeout=timeout)
-    finally:
+    except Exception as exc:
+        worker.terminate()
+        result = {
+            "ok": False,
+            "ready": False,
+            "error_code": type(exc).__name__,
+            "error_string": str(exc),
+            "outcome": "reopen_exception",
+            "opener_pid": opened["opener_pid"],
+            "child_exitcode": opened["child_exitcode"],
+        }
+        event_log.write_marker(
+            "stale_handle_reopen_exception",
+            f"{type(exc).__name__}: {exc}",
+            error_code=type(exc).__name__,
+            error_string=str(exc),
+            ready=False,
+            outcome="reopen_exception",
+        )
+        return result
+    except BaseException:
+        worker.terminate()
+        raise
+
+    if result.get("ok"):
+        worker.close(timeout=timeout)
+    else:
         worker.terminate()
     result.update(
         opener_pid=opened["opener_pid"],
@@ -343,6 +390,12 @@ def main(argv=None, *, input_fn=input):
     try:
         previous_handler = signal.signal(signal.SIGINT, request_stop)
         if args.stale_handle:
+            if not args.simulate:
+                _warn_hardware_only(
+                    event_log,
+                    "hardware_only_stale_handle_cli",
+                    "the stale-handle provoke CLI",
+                )
             run_stale_handle_probe(
                 simulate=args.simulate,
                 persistent_handle_path=marker_path,

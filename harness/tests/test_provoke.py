@@ -10,6 +10,7 @@ import time
 import pytest
 
 from harness.csv_log import CsvEventLog
+from harness.dpx_worker import WorkerProtocolError, WorkerTimeout
 from harness import provoke
 from harness.provoke import (
     bandwidth_reader,
@@ -32,6 +33,83 @@ def marker_names(path):
         for row in csv_rows(path)
         if row["row_type"] == "marker"
     ]
+
+
+def marker_rows(path, marker):
+    return [row for row in csv_rows(path) if row["marker"] == marker]
+
+
+class CompletedOpenedChildContext:
+    class ParentConnection:
+        def __init__(self, opened):
+            self.opened = opened
+
+        def poll(self, timeout):
+            return True
+
+        def recv(self):
+            return dict(self.opened)
+
+        def close(self):
+            pass
+
+    class ChildConnection:
+        def close(self):
+            pass
+
+    class ProcessHandle:
+        exitcode = 0
+
+        def start(self):
+            pass
+
+        def join(self, timeout):
+            pass
+
+        def is_alive(self):
+            return False
+
+        def terminate(self):
+            raise AssertionError("completed child must not be terminated")
+
+        def kill(self):
+            raise AssertionError("completed child must not be killed")
+
+        def close(self):
+            pass
+
+    def __init__(self):
+        self.opened = {
+            "ok": True,
+            "ready": True,
+            "error_code": "DPX_SUCCESS",
+            "error_string": "Success",
+            "opener_pid": os.getpid() + 1,
+        }
+
+    def Pipe(self, duplex):
+        return self.ParentConnection(self.opened), self.ChildConnection()
+
+    def Process(self, target, args):
+        return self.ProcessHandle()
+
+
+class ScriptedReopenWorker:
+    def __init__(self, start_result):
+        self.start_result = start_result
+        self.calls = []
+
+    def start(self, timeout):
+        self.calls.append(("start", timeout))
+        if isinstance(self.start_result, BaseException):
+            raise self.start_result
+        return dict(self.start_result)
+
+    def close(self, timeout):
+        self.calls.append(("close", timeout))
+
+    def terminate(self):
+        self.calls.append(("terminate",))
 
 
 def test_exactly_one_provocation_is_required():
@@ -162,6 +240,227 @@ def test_stale_handle_probe_records_cross_process_reopen_refusal(tmp_path):
         "stale_handle_opened",
         "stale_handle_reopen_refused",
     ]
+
+
+def test_successful_stale_reopen_closes_worker_gracefully(monkeypatch, tmp_path):
+    """Would catch terminating a successful reopen and leaking another handle."""
+    context = CompletedOpenedChildContext()
+    worker = ScriptedReopenWorker(
+        {
+            "ok": True,
+            "ready": True,
+            "error_code": "DPX_SUCCESS",
+            "error_string": "Success",
+        }
+    )
+    monkeypatch.setattr(provoke.multiprocessing, "get_context", lambda _: context)
+    monkeypatch.setattr(provoke, "DeviceWorker", lambda config: worker)
+
+    path = tmp_path / "successful-reopen.csv"
+    with CsvEventLog(path) as event_log:
+        result = run_stale_handle_probe(
+            simulate=True,
+            persistent_handle_path=tmp_path / "unused-marker",
+            event_log=event_log,
+            timeout=0.25,
+        )
+
+    assert result["ok"] is True
+    assert worker.calls == [("start", 0.25), ("close", 0.25)]
+    assert marker_names(path)[-1] == "stale_handle_reopened"
+
+
+def test_refused_stale_reopen_terminates_worker_resources(monkeypatch, tmp_path):
+    """Would catch trying to close a worker that never opened successfully."""
+    context = CompletedOpenedChildContext()
+    worker = ScriptedReopenWorker(
+        {
+            "ok": False,
+            "ready": False,
+            "error_code": "DPX_ERR_ALREADY_OPEN",
+            "error_string": "already open",
+        }
+    )
+    monkeypatch.setattr(provoke.multiprocessing, "get_context", lambda _: context)
+    monkeypatch.setattr(provoke, "DeviceWorker", lambda config: worker)
+
+    with CsvEventLog(tmp_path / "refused-reopen.csv") as event_log:
+        result = run_stale_handle_probe(
+            simulate=True,
+            persistent_handle_path=tmp_path / "unused-marker",
+            event_log=event_log,
+            timeout=0.5,
+        )
+
+    assert result["ok"] is False
+    assert worker.calls == [("start", 0.5), ("terminate",)]
+
+
+@pytest.mark.parametrize(
+    "exception",
+    [
+        WorkerTimeout("reopen timed out"),
+        WorkerProtocolError("reopen protocol failed"),
+        RuntimeError("backend import failed"),
+    ],
+)
+def test_stale_reopen_exception_is_structured_and_marked(
+    monkeypatch, tmp_path, exception
+):
+    """Would catch losing a reopen exception before it reaches the shared CSV."""
+    context = CompletedOpenedChildContext()
+    worker = ScriptedReopenWorker(exception)
+    monkeypatch.setattr(provoke.multiprocessing, "get_context", lambda _: context)
+    monkeypatch.setattr(provoke, "DeviceWorker", lambda config: worker)
+
+    path = tmp_path / f"{type(exception).__name__}.csv"
+    with CsvEventLog(path) as event_log:
+        result = run_stale_handle_probe(
+            simulate=True,
+            persistent_handle_path=tmp_path / "unused-marker",
+            event_log=event_log,
+            timeout=0.75,
+        )
+
+    assert result == {
+        "ok": False,
+        "ready": False,
+        "error_code": type(exception).__name__,
+        "error_string": str(exception),
+        "outcome": "reopen_exception",
+        "opener_pid": context.opened["opener_pid"],
+        "child_exitcode": 0,
+    }
+    rows = marker_rows(path, "stale_handle_reopen_exception")
+    assert len(rows) == 1
+    assert rows[0]["error_code"] == type(exception).__name__
+    assert rows[0]["error_string"] == str(exception)
+    assert rows[0]["outcome"] == "reopen_exception"
+    assert rows[0]["detail"] == f"{type(exception).__name__}: {exception}"
+    assert worker.calls == [("start", 0.75), ("terminate",)]
+
+
+def test_stale_reopen_does_not_swallow_base_exception(monkeypatch, tmp_path):
+    """Would catch converting process-control interrupts into ordinary results."""
+    context = CompletedOpenedChildContext()
+    worker = ScriptedReopenWorker(KeyboardInterrupt())
+    monkeypatch.setattr(provoke.multiprocessing, "get_context", lambda _: context)
+    monkeypatch.setattr(provoke, "DeviceWorker", lambda config: worker)
+
+    with CsvEventLog(tmp_path / "base-exception.csv") as event_log:
+        with pytest.raises(KeyboardInterrupt):
+            run_stale_handle_probe(
+                simulate=True,
+                persistent_handle_path=tmp_path / "unused-marker",
+                event_log=event_log,
+                timeout=0.5,
+            )
+    assert worker.calls == [("start", 0.5), ("terminate",)]
+
+
+def test_hardware_only_helper_warns_and_marks_before_process_setup(
+    monkeypatch, tmp_path, capsys
+):
+    """Would catch touching hardware before labeling the helper path."""
+
+    def stop_before_process_setup(_method):
+        raise RuntimeError("process setup sentinel")
+
+    monkeypatch.setattr(
+        provoke.multiprocessing,
+        "get_context",
+        stop_before_process_setup,
+    )
+    path = tmp_path / "hardware-helper.csv"
+    with CsvEventLog(path) as event_log:
+        with pytest.raises(RuntimeError, match="process setup sentinel"):
+            run_stale_handle_probe(
+                simulate=False,
+                persistent_handle_path=tmp_path / "unused-real-marker",
+                event_log=event_log,
+                timeout=0.5,
+            )
+
+    output = capsys.readouterr().out
+    assert "HARDWARE-ONLY" in output
+    assert "not electrical verification" in output
+    rows = marker_rows(path, "hardware_only_stale_handle_helper")
+    assert len(rows) == 1
+    assert rows[0]["outcome"] == "hardware_only"
+    assert "HARDWARE-ONLY" in rows[0]["detail"]
+
+
+def test_hardware_only_reopen_warns_and_marks_before_worker_start(
+    monkeypatch, tmp_path, capsys
+):
+    """Would catch opening the real device before labeling the reopen path."""
+    context = CompletedOpenedChildContext()
+    path = tmp_path / "hardware-reopen.csv"
+
+    class WarningAwareWorker(ScriptedReopenWorker):
+        def start(self, timeout):
+            assert marker_names(path)[-1] == "hardware_only_stale_handle_reopen"
+            return super().start(timeout)
+
+    worker = WarningAwareWorker(
+        {
+            "ok": False,
+            "ready": False,
+            "error_code": "DPX_ERR_ALREADY_OPEN",
+            "error_string": "already open",
+        }
+    )
+    monkeypatch.setattr(provoke.multiprocessing, "get_context", lambda _: context)
+    monkeypatch.setattr(provoke, "DeviceWorker", lambda config: worker)
+
+    with CsvEventLog(path) as event_log:
+        run_stale_handle_probe(
+            simulate=False,
+            persistent_handle_path=tmp_path / "unused-real-marker",
+            event_log=event_log,
+            timeout=0.5,
+        )
+
+    output = capsys.readouterr().out
+    assert output.count("HARDWARE-ONLY") == 2
+    assert marker_names(path) == [
+        "hardware_only_stale_handle_helper",
+        "stale_handle_opened",
+        "hardware_only_stale_handle_reopen",
+        "stale_handle_reopen_refused",
+    ]
+
+
+def test_hardware_only_cli_warns_and_marks_before_probe(
+    monkeypatch, tmp_path, capsys
+):
+    """Would catch entering a real stale-handle CLI path without a warning."""
+    csv_path = tmp_path / "hardware-cli.csv"
+
+    def stop_before_probe(**kwargs):
+        assert marker_names(csv_path)[-1] == "hardware_only_stale_handle_cli"
+        raise RuntimeError("probe sentinel")
+
+    monkeypatch.setattr(provoke, "run_stale_handle_probe", stop_before_probe)
+    with pytest.raises(RuntimeError, match="probe sentinel"):
+        main(
+            [
+                "--stale-handle",
+                "--duration",
+                "0",
+                "--csv",
+                str(csv_path),
+                "--text-log",
+                str(tmp_path / "hardware-cli.log"),
+            ]
+        )
+
+    output = capsys.readouterr().out
+    assert "HARDWARE-ONLY" in output
+    assert "not electrical verification" in output
+    rows = marker_rows(csv_path, "hardware_only_stale_handle_cli")
+    assert len(rows) == 1
+    assert rows[0]["outcome"] == "hardware_only"
 
 
 def test_no_flush_changes_only_the_flush_configuration():
