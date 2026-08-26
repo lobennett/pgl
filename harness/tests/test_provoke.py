@@ -712,7 +712,7 @@ def test_sigint_stops_cli_and_closes_worker(tmp_path):
             sys.executable,
             "-m",
             "harness.provoke",
-            "--no-flush",
+            "--kvm",
             "--simulate",
             "--interval",
             "0.01",
@@ -725,11 +725,19 @@ def test_sigint_stops_cli_and_closes_worker(tmp_path):
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        stdin=subprocess.PIPE,
         text=True,
     )
     deadline = time.monotonic() + 5
-    while not csv_path.exists() and time.monotonic() < deadline:
+    while time.monotonic() < deadline:
+        if csv_path.exists():
+            if any(row["row_type"] == "trigger" for row in csv_rows(csv_path)):
+                break
         time.sleep(0.01)
+    else:
+        process.kill()
+        process.communicate(timeout=5)
+        pytest.fail("provoke worker did not record a trigger before SIGINT")
     process.send_signal(signal.SIGINT)
     stdout, stderr = process.communicate(timeout=5)
     assert process.returncode == 0, (stdout, stderr)
