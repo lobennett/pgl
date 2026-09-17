@@ -173,12 +173,18 @@ class pglSettingsManager:
         displays = []
         
         # Get CGDisplayCreateUUIDFromDisplayID
+        createDisplayUUID = None
         try:
             from ColorSync import CGDisplayCreateUUIDFromDisplayID
+            createDisplayUUID = CGDisplayCreateUUIDFromDisplayID
         except ImportError as e:
             pglMessages.message(f"CGDisplayCreateUUIDFromDisplayID not found in ColorSync, trying Quartz: {e}")
             # fallback: some builds expose it under Quartz
-            from Quartz import CGDisplayCreateUUIDFromDisplayID
+            try:
+                from Quartz import CGDisplayCreateUUIDFromDisplayID
+                createDisplayUUID = CGDisplayCreateUUIDFromDisplayID
+            except ImportError as e:
+                pglMessages.message(f"CGDisplayCreateUUIDFromDisplayID not found in Quartz, using display hardware identity: {e}")
             
         # first check saved displays
         displayDir = cls.getDisplayDir()
@@ -254,10 +260,6 @@ class pglSettingsManager:
 
             displaySettings.displayModes = displayModes     
                    
-            # get UUID
-            uuidRef = CGDisplayCreateUUIDFromDisplayID(displayID)
-            displaySettings.uuid = str(CoreFoundation.CFUUIDCreateString(None, uuidRef))
-            
             # get other infor from quartz
             displaySettings.vendor        = Quartz.CGDisplayVendorNumber(displayID)
             displaySettings.model         = Quartz.CGDisplayModelNumber(displayID)
@@ -265,6 +267,16 @@ class pglSettingsManager:
             displaySettings.isMain        = Quartz.CGDisplayIsMain(displayID)
             displaySettings.isBuiltin     = Quartz.CGDisplayIsBuiltin(displayID)
             displaySettings.gammaTableSize = Quartz.CGDisplayGammaTableCapacity(displayID)
+
+            # get UUID
+            if createDisplayUUID is not None:
+                uuidRef = createDisplayUUID(displayID)
+                displaySettings.uuid = str(CoreFoundation.CFUUIDCreateString(None, uuidRef))
+            else:
+                unit = Quartz.CGDisplayUnitNumber(displayID)
+                hardwareIdentity = (f"pgl-display:{displaySettings.vendor}:{displaySettings.model}:"
+                                    f"{displaySettings.serialNumber}:{unit}")
+                displaySettings.uuid = str(uuid.uuid5(uuid.NAMESPACE_OID, hardwareIdentity))
             
             # get display human readable name
             displaySettings.name = cls.getMatchingDisplayName(displayID)                    

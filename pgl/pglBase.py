@@ -74,7 +74,7 @@ class pglBase:
         # github status
         
         # get socket path
-        self.metalSocketPath = os.path.join(self.homeDir, "Library/Containers/gru.mglMetal/Data")
+        self.metalSocketPath = self.prepareMetalSocketPath(self.homeDir)
 
         # print what we are doing
         if self.verbose > 0: 
@@ -122,6 +122,13 @@ class pglBase:
         pglDir = inspect.getfile(cls)
         pglDir = os.path.dirname(os.path.dirname(pglDir))
         return(Path(pglDir))
+
+    @staticmethod
+    def prepareMetalSocketPath(homeDir):
+        socketPath = Path(homeDir) / "Library" / "Containers" / "gru.mglMetal" / "Data"
+        socketPath.mkdir(mode=0o700, parents=True, exist_ok=True)
+        socketPath.chmod(0o700)
+        return str(socketPath)
 
 
     ################################################################

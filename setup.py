@@ -1,6 +1,7 @@
 import numpy
 from setuptools import setup, find_packages, Extension
 import sys
+from pathlib import Path
 
 if sys.platform != 'darwin':
     raise RuntimeError("This package only works on macOS")
@@ -44,10 +45,17 @@ eventListenerExtension = Extension(
     ]
 )
 
+metalPackageData = [
+    str(path.relative_to("metal"))
+    for path in Path("metal").rglob("*")
+    if path.is_file() and path.name != "__init__.py"
+]
+
 setup(
     name='pgl',  
     version='0.1.0',
-    packages=find_packages(), 
+    packages=find_packages(),
+    package_data={"metal": metalPackageData},
     description='PGL Psychophysics and experiment library',
     python_requires='>=3.9',
     ext_modules=[displayInfoExtension,gammaTableExtension,timestampExtension,eventListenerExtension]
