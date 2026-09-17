@@ -49,7 +49,7 @@ class pglChooseBlock(pglTraitSettings):
             ),
         )
 
-def pglDigitalBrainConfigure(e, currentRun):
+def pglDigitalBrainConfigure(e, currentRun, moviePath=None):
     if currentRun is None:
         pglMessages.warning("Must set current run parameters for each block before initializing experiment")
 
@@ -69,7 +69,7 @@ def pglDigitalBrainConfigure(e, currentRun):
     e.addTask(calibrationTask)
 
     # description task
-    descriptionTask = pglDigitalBrainMemoryTask(pgl, subjectNum=currentRun.subjectNum, dayNum=currentRun.dayNum, blockNum=currentRun.blockNum, descriptionLength=descriptionLength, displayWidth=displayWidth)
+    descriptionTask = pglDigitalBrainMemoryTask(pgl, subjectNum=currentRun.subjectNum, dayNum=currentRun.dayNum, blockNum=currentRun.blockNum, descriptionLength=descriptionLength, displayWidth=displayWidth, moviePath=moviePath)
     descriptionTask.settings.phaseNum = 2
     e.addTask(descriptionTask)
 
@@ -89,7 +89,7 @@ def pglDigitalBrainConfigure(e, currentRun):
 class pglDigitalBrainMemoryTask(pglTask):
     
     ########################
-    def __init__(self, pgl, subjectNum, dayNum, blockNum, descriptionLength=12, displayWidth=30):
+    def __init__(self, pgl, subjectNum, dayNum, blockNum, descriptionLength=12, displayWidth=30, moviePath=None):
         super().__init__(pgl)
         
         # initialize the key buffer
@@ -106,7 +106,7 @@ class pglDigitalBrainMemoryTask(pglTask):
             #'moviePath':'/Users/Shared/digital-assets/stimulus/digital/0008',
             #'moviePath':'/Users/justin/Desktop/testvideos',
             #'moviePath':'/Users/Shared/digital',
-            'moviePath':'/Users/justin/Desktop/digitalbrain/digital',
+            'moviePath':str(moviePath) if moviePath is not None else '/Users/justin/Desktop/digitalbrain/digital',
             'displayWidth': displayWidth,
             'subjectNum': subjectNum,
             'dayNum': dayNum,
@@ -132,7 +132,7 @@ class pglDigitalBrainMemoryTask(pglTask):
         }
         
         # create the blockPath
-        self.state.blockPath = Path(p['moviePath']) / f"1{subjectNum}{dayNum}{blockNum}"
+        self.state.blockPath = Path(p['moviePath']) if moviePath is not None else Path(p['moviePath']) / f"1{subjectNum}{dayNum}{blockNum}"
 
         # load movie database
         self.mdb = pglMovieDatabase(self.state.blockPath)
