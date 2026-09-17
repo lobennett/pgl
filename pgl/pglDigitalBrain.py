@@ -49,7 +49,8 @@ class pglChooseBlock(pglTraitSettings):
             ),
         )
 
-def pglDigitalBrainConfigure(e, currentRun, moviePath=None):
+def pglDigitalBrainConfigure(e, currentRun, moviePath=None, event_callback=None):
+    """Configure native phases, optionally observing the memory task lifecycle."""
     if currentRun is None:
         pglMessages.warning("Must set current run parameters for each block before initializing experiment")
 
@@ -69,7 +70,7 @@ def pglDigitalBrainConfigure(e, currentRun, moviePath=None):
     e.addTask(calibrationTask)
 
     # description task
-    descriptionTask = pglDigitalBrainMemoryTask(pgl, subjectNum=currentRun.subjectNum, dayNum=currentRun.dayNum, blockNum=currentRun.blockNum, descriptionLength=descriptionLength, displayWidth=displayWidth, moviePath=moviePath)
+    descriptionTask = pglDigitalBrainMemoryTask(pgl, subjectNum=currentRun.subjectNum, dayNum=currentRun.dayNum, blockNum=currentRun.blockNum, descriptionLength=descriptionLength, displayWidth=displayWidth, moviePath=moviePath, event_callback=event_callback)
     descriptionTask.settings.phaseNum = 2
     e.addTask(descriptionTask)
 
@@ -87,10 +88,31 @@ def pglDigitalBrainConfigure(e, currentRun, moviePath=None):
 # Memory task
 ###########################################
 class pglDigitalBrainMemoryTask(pglTask):
+    """Native memory task with optional synchronous lifecycle observation.
+
+    event_callback(kind, trial_index, payload) receives a zero-based index into
+    manifest-ordered stimuli. The prepared manifest must use contiguous indices
+    0..nStimuli-1. Payloads contain filename and condition; response_saved and
+    trial_completed also contain description and responses (response: int,
+    response_type: int, timestamp: float). stimulus_finished includes
+    presented_frame_count: int, the length of native presentedTimes (including
+    dropped-frame records), never the timing arrays themselves.
+
+    trial_loaded follows successful movie creation. stimulus_started precedes
+    blocking play(), and stimulus_finished follows its successful return with
+    nonempty presentedTimes; an empty array raises RuntimeError with hooks enabled.
+    These are API boundaries, not measured frame-onset timestamps. response_started
+    follows description-buffer initialization. response_saved means the text is
+    stored in currentParams, not persisted to disk. trial_completed is emitted
+    only by endTrial(), never by abort/cleanup end(). Callback exceptions are
+    deliberately propagated to stop native execution. None retains upstream
+    behavior, including native failure handling.
+    """
     
     ########################
-    def __init__(self, pgl, subjectNum, dayNum, blockNum, descriptionLength=12, displayWidth=30, moviePath=None):
+    def __init__(self, pgl, subjectNum, dayNum, blockNum, descriptionLength=12, displayWidth=30, moviePath=None, event_callback=None):
         super().__init__(pgl)
+        self.event_callback = event_callback
         
         # initialize the key buffer
         self.keyBuffer = pglKeyBuffer(maxLineLength=40)
@@ -156,6 +178,29 @@ class pglDigitalBrainMemoryTask(pglTask):
             print(f"{iStimulus}: filename: {m.filename} condition: {m.condition}")
                     
                     
+    def _emit_event(self, kind):
+        if self.event_callback is None:
+            return
+        trial_index = int(self.currentParams['movieNum'])
+        stimulus = self.mdb.stimuli[trial_index]
+        payload = {'filename': str(stimulus.filename), 'condition': str(stimulus.condition)}
+        if kind == 'stimulus_finished':
+            payload['presented_frame_count'] = len(self.m.presentedTimes)
+        if kind in {'response_saved', 'trial_completed'}:
+            payload['description'] = str(self.currentParams['description'])
+            payload['responses'] = [
+                {'response': int(event.response),
+                 'response_type': int(event.responseType),
+                 'timestamp': float(event.timestamp)}
+                for event in self.data.events[self._trial_event_start:]
+                if event.type == 'subjectResponse'
+            ]
+        self.event_callback(kind, trial_index, payload)
+
+    def endTrial(self, endTime):
+        super().endTrial(endTime)
+        self._emit_event('trial_completed')
+
     ########################
     def startSegment(self, startTime):
         '''
@@ -164,6 +209,8 @@ class pglDigitalBrainMemoryTask(pglTask):
         super().startSegment(startTime)
         
         if self.state.currentSegment == 0:
+            if self.event_callback is not None:
+                self._trial_event_start = len(self.data.events)
             self.e.flush = True
             # do not eat keys
             self.e.setEatAllKeys(False)
@@ -171,12 +218,21 @@ class pglDigitalBrainMemoryTask(pglTask):
             moviePath = self.mdb.stimuli[self.currentParams['movieNum']].filename
             condition = self.mdb.stimuli[self.currentParams['movieNum']].condition
             self.m = self.pgl.movie(filename=str(moviePath),displayWidth=self.settings.fixedParameters['displayWidth'])
+            if self.event_callback is not None and (self.m is None or self.m.movieNum is None):
+                raise RuntimeError(f"Could not load movie: {moviePath}")
             pglMessages.message(f"{self.state.currentTrial}: {self.m} moviePath: {moviePath} condition: {condition}")
+            self._emit_event('trial_loaded')
         
         elif self.state.currentSegment == 1:
             self.state.gotResponse = False
             # play the movie
-            self.m.play(displayWidth=self.settings.fixedParameters['displayWidth'])
+            self._emit_event('stimulus_started')
+            play_result = self.m.play(displayWidth=self.settings.fixedParameters['displayWidth'])
+            if self.event_callback is not None and play_result is False:
+                raise RuntimeError("Could not play movie")
+            if self.event_callback is not None and len(self.m.presentedTimes) == 0:
+                raise RuntimeError("Movie playback returned no frames")
+            self._emit_event('stimulus_finished')
             self.jumpSegment()
 
         elif self.state.currentSegment == 2:
@@ -186,12 +242,14 @@ class pglDigitalBrainMemoryTask(pglTask):
             self.state.keyBufferDirty=False
             self.state.elapsedTime = -1
             self.e.flush = False
+            self._emit_event('response_started')
 
         elif self.state.currentSegment == 3:
             self.e.flush = True
             self.e.setEatAllKeys(False)
             # save the description
             self.currentParams['description'] = self.keyBuffer.getText()
+            self._emit_event('response_saved')
     ########################
     def updateScreen(self):
         if self.state.currentSegment == 0:

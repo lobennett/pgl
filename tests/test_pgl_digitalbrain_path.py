@@ -27,6 +27,10 @@ class HeadlessTask:
 
 @pytest.fixture
 def digitalbrain(monkeypatch):
+    return load_digitalbrain(monkeypatch)
+
+
+def load_digitalbrain(monkeypatch, task_class=HeadlessTask):
     """Load the real module without PGL's native/display/device imports."""
     package_name = "_pgl_digitalbrain_path_test"
     package = ModuleType(package_name)
@@ -34,7 +38,7 @@ def digitalbrain(monkeypatch):
     monkeypatch.setitem(sys.modules, package_name, package)
     dependencies = {
         "pglSettings": {"pglTraitSettings": object},
-        "pglExperiment": {"pglTask": HeadlessTask},
+        "pglExperiment": {"pglTask": task_class},
         "pglKeyboardMouse": {"pglKeyBuffer": Mock()},
         "pglImage": {"pglMovieDatabase": Mock()},
         "pglParameter": {"pglParameter": Mock()},
@@ -106,6 +110,23 @@ def test_task_preserves_default_root_suffix_and_positional_arguments(
     digitalbrain.pglMovieDatabase.assert_called_once_with(expected)
     assert task.settings.seglen == [0.5, float("inf"), 9, 0.5]
     assert task.settings.fixedParameters["displayWidth"] == 42
+
+
+def test_configure_forwards_callback_only_to_memory_task(digitalbrain, tmp_path):
+    tasks = []
+    experiment = SimpleNamespace(pgl=object(), addTask=tasks.append)
+    current_run = SimpleNamespace(
+        subjectNum=2, dayNum=3, blockNum=4, descriptionLength=9, displayWidth=42
+    )
+    callback = Mock()
+
+    digitalbrain.pglDigitalBrainConfigure(
+        experiment, current_run, moviePath=tmp_path, event_callback=callback
+    )
+
+    assert tasks[2].event_callback is callback
+    assert all(not hasattr(task, "event_callback") for task in tasks[:2] + tasks[3:])
+    callback.assert_not_called()
 
 
 @pytest.mark.parametrize("path_mode", ["omitted", "none", "str", "path"])
