@@ -177,7 +177,7 @@ class pglExperimentBase(pglStateDataSettings):
             return
  
         # call parent class to load the experiment data, settings, and state
-        print(f"(pglExperiment:load) Loading experimentdata from: {experimentPath}")
+        pglMessages.message(f"(pglExperiment:load) Loading experimentdata from: {experimentPath}")
         obj = super().load(dataPath=experimentPath, filesystem=filesystem,filesystemPrefix=filesystemPrefix, loadAsClass=cls)
         if obj is None:
             if experimentPath is not None:
@@ -218,7 +218,8 @@ class pglExperimentBase(pglStateDataSettings):
             
             for iTask, taskName in enumerate(obj.experimentSettings.tasks):
                 # get the task directory
-                taskPath = f"{experimentPath}{filesystem.sep}{taskName}"
+                taskDirName = pglTask.getTaskDirectoryName(iTask,taskName)
+                taskPath = f"{experimentPath}{filesystem.sep}{taskDirName}"
 
                 # load the task data
                 if filesystem.isdir(taskPath):
@@ -232,7 +233,7 @@ class pglExperimentBase(pglStateDataSettings):
                         obj.addTask(task, addToTaskList=False)
                         pass
                 else:
-                    pglMessages.warning(f"Could not find task {taskName}: taskPath")
+                    pglMessages.warning(f"Could not find task {taskName}: {taskPath}")
         
         # return the created object
         return obj
@@ -248,7 +249,7 @@ class pglExperimentBase(pglStateDataSettings):
         task.pgl = self.pgl
         task.e = self
         self.nTasks += 1
-        task.taskID = self.nTasks
+        task.settings.taskID = self.nTasks
 
         # if we want to add the task as a new phase
         if addPhase and self.tasks is not None:            
@@ -289,11 +290,11 @@ class pglExperimentBase(pglStateDataSettings):
         from pgl import pglTimestamp
         timestamp = pglTimestamp()
         # print separator
-        print("=" * 80)
+        pglMessages.printHeader()
         
         # print experiment name, subject ID, and duration
-        print(f"Experiment: {self.experimentSettings.experimentName} | Subject ID: {self.experimentSettings.subjectID}")
-        print(f"Duration: {timestamp.formatDuration(self.experimentDuration())}")
+        pglMessages.print(f"Experiment: {self.experimentSettings.experimentName} | Subject ID: {self.experimentSettings.subjectID}")
+        pglMessages.print(f"Duration: {timestamp.formatDuration(self.experimentDuration())}")
         
         # FIX, FIX, FIX - old way
         #displayInfo = f"Display: {self.settings.displayName[0] if self.settings.displayName and len(self.settings.displayName) > 0 else 'Unknown'} "
@@ -303,21 +304,21 @@ class pglExperimentBase(pglStateDataSettings):
         #print(displayInfo)
         
         numVols = self.data.getNumEvents(type="volumeTrigger")
-        print(f"Number of volume triggers: {numVols}")
+        pglMessages.print(f"Number of volume triggers: {numVols}")
         if numVols > 1:
             triggerStats = self.data.getTriggerStats()
-            print(f"Median time between triggers: {triggerStats.median:.3f}s")
-            print(f"Mean ± std time between triggers: {triggerStats.mean:.3f} ± {triggerStats.std:.6f}s")
+            pglMessages.print(f"Median time between triggers: {triggerStats.median:.3f}s")
+            pglMessages.print(f"Mean ± std time between triggers: {triggerStats.mean:.3f} ± {triggerStats.std:.6f}s")
 
         # print task names
         for taskName in self.experimentSettings.tasks:
-            print(f"taskName: {taskName}")
+            pglMessages.print(f"taskName: {taskName}")
 
         # print task data
         if hasattr(self, "tasks"):
             for task in self.tasks:
                 # print separtor
-                print("=" * 80)
+                pglMessages.printHeader()
                 # print task
                 task.print()   
                 
@@ -469,7 +470,7 @@ class pglExperiment(pglExperimentBase):
             backgroundColor: The background color as a list of RGB values, each between 0 and 1. If omitted, will use the color from settings.
         '''    
         if self.settings is None:
-            print("(pglExperiment:initScreen) No settings found to open screen.")
+            pglMessages.warning("(pglExperiment:initScreen) No settings found to open screen.")
             return
         # get background color
         if backgroundColor == -1:
@@ -482,6 +483,9 @@ class pglExperiment(pglExperimentBase):
                 return
             self.state.display = self.settings.displays[0]
         
+            # make pgl quieter
+            self.setVerbose()
+            
             # close all other screens
             self.pgl.cleanUp()
             
@@ -495,13 +499,14 @@ class pglExperiment(pglExperimentBase):
             else:
                 if self.state.display.currentDisplayNum == -1:
                     pglMessages.warning(f"Could not open display {self.state.display.name} because it is not connected")
+                    self.endVerbose()
                     return
                 # compare to what is desired
                 displayMode = None
                 if self.state.display.displayModes:
                     displayMode = self.state.display.displayModes[0]
                     if displayMode == self.state.originalScreenResolution:
-                        pglMessages.message("Match")
+                        pglMessages.message(f"Display mode settings {self.state.screenResolution[0]} x {self.state.screenResolution[1]} {self.state.screenResolution[2]}Hz {self.state.screenResolution[3]}bits match current mode")
                     else:
                         self.pgl.setResolutionUsingDisplayModeSettings(self.state.display.currentDisplayNum, displayMode)      
                         self.state.screenResolution = self.pgl.getResolution()
@@ -514,6 +519,7 @@ class pglExperiment(pglExperimentBase):
             # check whether it was opened
             if not self.pgl.isOpen():   
                 pglMessages.warning("Failed to open screen.")
+                self.endVerbose()
                 return
             
             # set visual angle coordinates
@@ -608,6 +614,12 @@ class pglExperiment(pglExperimentBase):
 
             # display device status
             self.pgl.deviceStatus()
+            
+            # set up digitalIO
+            self.initDigitalIO()
+            
+            # set up devices
+            self.initDevices()
 
             # call configure on all tasks, this allows any task with configure implemeneted
             # to use information from the initialized pglExperiment in its configurtion
@@ -623,6 +635,7 @@ class pglExperiment(pglExperimentBase):
         except Exception as e:
             pglMessages.warning(f"Could not open screen. Error {type(e).__name__}: {e}")    
             self.state.openScreen = False
+            self.endVerbose()
             return
 
     def setGamma(self, settings, display):
@@ -662,8 +675,7 @@ class pglExperiment(pglExperimentBase):
             keyboardDevices = self.pgl.devicesGet(pglKeyboardMouse)
             if keyboardDevices is not []:
                 for keyboardDevice in keyboardDevices:
-                    print("(pglExperiment:endScreen) Stopping keyboard/mouse device.")
-                    print(keyboardDevice)
+                    pglMessages.message(f"Stopping keyboard/mouse device: {keyboardDevice}")
                     keyboardDevice.stop()
 
             if self.settings.closeScreenOnEnd:
@@ -673,7 +685,7 @@ class pglExperiment(pglExperimentBase):
                 
                 # reset gamma
                 if self.state.originalGammaTable:
-                    self.pgl.message("Restoring gamma table")
+                    pglMessages.message("Restoring gamma table")
                     self.pgl.setGammaTable(self.state.display.currentDisplayNum, rgbGammaTable=self.state.originalGammaTable)
                     pglMessages.message("Restoring original gamma table")
                     
@@ -686,9 +698,12 @@ class pglExperiment(pglExperimentBase):
                 # close screen
                 self.pgl.close()
                 self.state.openScreen = False
+                
         except Exception as e:
             pglMessages.warning(f"Could not close screen. Error {type(e).__name__}: {e}")    
             return
+        finally:
+            self.endVerbose()
                 
 
     def setEatAllKeys(self, eatAllKeys=False):
@@ -760,7 +775,7 @@ class pglExperiment(pglExperimentBase):
                     # end manual pre-start
                     if manualPreStart:
                         manualPreStart = False
-                        print(f"(pglExperiment:run) Manual pre-start ended after {manualPreStartVolumes} volumes.")
+                        pglMessages.message(f"Manual pre-start ended after {manualPreStartVolumes} volumes.", messageType='experiment')
                     # or start experiment
                     else:
                         self.state.experimentStarted = True
@@ -776,7 +791,7 @@ class pglExperiment(pglExperimentBase):
                                 # ignore initial volumes
                                 ignoreInitialVolumes -= 1
                             else:
-                                print(f"(pglExperiment:run) Ignored {self.settings.ignoreInitialVolumes} initial volumes.")
+                                pglMessages.message(f"Ignored {self.settings.ignoreInitialVolumes} initial volumes.",messageType='experiment')
                                 self.state.experimentStarted = True
                                 self.state.volumeNumber += 1
                                 # and add a volume event
@@ -788,9 +803,10 @@ class pglExperiment(pglExperimentBase):
                     self.state.experimentDone = True
         
         # start the experiment
+        pglMessages.message(f"Experiment started.",messageType='experiment')
         self.startPhase(phaseNum=0)
-        print(f"(pglExperiment:run) Experiment started.")
         self.data.startTime = self.pgl.getSecs()
+        self.data.startDateTime = datetime.now().astimezone().isoformat()
 
         while not self.state.experimentDone:
             
@@ -862,7 +878,8 @@ class pglExperiment(pglExperimentBase):
 
         # mark end time
         self.data.endTime = self.pgl.getSecs()
-        print("(pglExperiment:run) Experiment done.")
+        pglMessages.message("Experiment done.",messageType='experiment')
+        pglMessages.printHeader(messageType='experiment')
         
         # save data
         self.save()
@@ -873,6 +890,37 @@ class pglExperiment(pglExperimentBase):
         # if we got here then we finished the run without error
         self.state.runFinishedWithError = False
     
+    def initDigitalIO(self):
+        '''
+        initialize digital IO device if settings calls for them to be initialized
+        '''
+        pglMessages.printHeader()
+        pglMessages.print(self.settings.digitalIO)
+        pglMessages.printHeader()
+        #for digitalIO in self.settings.digitalIO:
+            
+
+    def endDigitalIO(self):
+        '''
+        end digitalIO devices
+        '''
+        
+    def initDevices(self):
+        '''
+        initialize devices
+        '''
+        pglMessages.printHeader()
+        pglMessages.print(self.settings.devices)
+        pglMessages.printHeader()
+        #for digitalIO in self.settings.digitalIO:
+            
+
+    def endDevices(self):
+        '''
+        end digitalIO devices
+        '''
+        
+        
     def initEyeTracker(self):
         '''Initialize eye tracker if we have an eye tracker.'''
         # load eye tracker settings
@@ -884,7 +932,7 @@ class pglExperiment(pglExperimentBase):
             self.settings.edfFilename = f"{datetime.now().strftime('%Y%m%d')}"
 
             # init the eyeink
-            print(f"(pglExperiment) Initialize Eyelink with filename: {self.settings.edfFilename}")
+            pglMessages.message(f"(pglExperiment) Initialize Eyelink with filename: {self.settings.edfFilename}",messageType='experiment')
             self.eyeTracker = pglEyelink(pgl=self.pgl, edfFilename=self.settings.edfFilename)  
 
             # check if running
@@ -901,7 +949,7 @@ class pglExperiment(pglExperimentBase):
         elif self.settings.eyetracker[0] == "None":
             self.eyeTracker = None
         else:
-            print("(pglExperiment) ❌ Unknown eye tracker type {self.settings.eyetracker[0]}")
+            pglMessages.warning(f"Unknown eye tracker type {self.settings.eyetracker[0]}")
             self.eyeTracker = None
 
 
@@ -920,7 +968,7 @@ class pglExperiment(pglExperimentBase):
             self.settings.skipCalibrationKeyCode = self.keyboardMouse.charToKeyCode(self.settings.skipCalibrationKey)
             # instructions
             displayText = f"Press {self.settings.calibrateKey} to calibrate eye tracker. {self.settings.skipCalibrationKey} to skip."
-            pglMessages.message(displayText)
+            pglMessages.message(displayText, messageType='experiment')
 
             k = self.pgl.devicesGetKeyboard()            
             eatKeys = k.eatKeyCodes
@@ -944,7 +992,7 @@ class pglExperiment(pglExperimentBase):
                 elif [e for e in events if e.type == "keyboard" and e.eventType == "keydown" and e.keyCode == self.settings.skipCalibrationKeyCode]:
                     self.state.waitingForCalibration = False
                     self.state.runCalibration = False
-                    print("(pglExperiment:calibrateEyeTracker) Skipping eye tracker calibration.")
+                    pglMessages.message("Skipping eye tracker calibration.",messageType='experiment')
 
             # reset eat keys
             self.pgl.setEatKeys(eatKeys)    
@@ -965,6 +1013,9 @@ class pglExperiment(pglExperimentBase):
         Start the current phase of the experiment.
         '''
         self.state.phaseNum = phaseNum
+        
+        # starting phase
+        pglMessages.message(f"Starting phase: {self.state.phaseNum+1}/{len(self.state.phaseNums)}",messageType='experiment')
         
         # get the current tasks based on the current phase number
         self.currentTasks = [task for task in self.tasks if task.settings.phaseNum is None or task.settings.phaseNum == self.state.phaseNum]
@@ -988,8 +1039,23 @@ class pglExperiment(pglExperimentBase):
                 self.state.currentPhaseIndex += 1
                 self.startPhase(phaseNum=self.state.phaseNums[self.state.currentPhaseIndex])
 
-        print(f"(pglExperiment:startPhase) Starting phase: {self.state.phaseNum}/{len(self.state.phaseNums)}")
-        
+    def isAbortedRun(self):
+        '''
+        heuristics to reutnr true/false on aborted runs
+        '''
+        aborted = False
+        for task in self.tasks:
+            if task.settings.nTrials != np.inf:
+                # if less trials than nTrials were run, then it is aborted
+                if task.state.currentTrial+1 < task.settings.nTrials:
+                    pglMessages.message(f"Detected aborted task with {task.state.currentTrial+1}/{task.settings.nTrials} trials run: {task.settings.taskSaveName}", messageType='experiment')
+                    aborted=True
+            else:
+                # if less than 10 trials were run it is aborted
+                if task.state.currentTrial < 10:
+                    pglMessages.message(f"Detected aborted task with less than 10 trials: {task.settings.taskSaveName}",messageType='experiment')
+                    aborted=True
+        return aborted
     
     def save(self):
         '''
@@ -997,12 +1063,17 @@ class pglExperiment(pglExperimentBase):
         '''
         # Create the directory to save data into (dataDir/experimentSaveName/subjectID/YYYYMMDD_HHMMSS)
         try:
+            if self.settings.saveAbortedRunsToTrash and self.isAbortedRun():
+                runName = Path("trash") / self.experimentSettings.runName
+            else:
+                runName = self.experimentSettings.runName
+            
             dataPath = (
                 Path(self.settings.dataPath).expanduser()
                 / self.experimentSettings.experimentSaveName
                 / self.experimentSettings.subjectID
                 / self.experimentSettings.sessionName
-                / self.experimentSettings.runName
+                / runName
             )
 
             # If the run directory already exists, append a timestamp to its name.
@@ -1012,11 +1083,11 @@ class pglExperiment(pglExperimentBase):
 
             dataPath.mkdir(parents=True, exist_ok=False)
         except Exception as e:
-            print(f"(pglExperiment:save) ❌ Could not create data directory {dataPath}: {e}")
+            pglMessages.warning(f"Could not create data directory {dataPath}: {e}")
             return
         
         # give user feedback where things are being saved
-        print(f"(pglExperiment:save) Saving experiment data to: {dataPath}")
+        pglMessages.message(f"Saving experiment data to: {dataPath}",messageType='experiment')
         
         # save eye tracker data if we have an eye tracker
         if self.eyeTracker is not None:
@@ -1035,15 +1106,43 @@ class pglExperiment(pglExperimentBase):
         # and call parent to save rest
         super().save(dataPath=dataPath)
     
-    def getLastRun(self):
-        '''
-        will load the last run of the experiment, so parameters that were run last can be checked
-        '''
+    def getLastRun(self, task=None, allRuns=False):
+        """Load saved runs or their matching tasks.
+
+        Args:
+            task (pglTask, optional): A task from self.tasks. When provided,
+                return the task at the same index in each selected run.
+            allRuns (bool): Return all matches, newest first, instead of
+                only the latest run's match.
+
+        Returns:
+            When allRuns=False:
+                pglRun, pglTask, or None if no match exists.
+            When allRuns=True:
+                A list of pglRun or pglTask objects, or an empty list.
+                Tasks missing from a saved run are omitted.
+        """
         try:
-            # import pglRun
             from .pglSession import pglRun
-            
-            # path where this experiment is being stored
+
+            emptyResult = [] if allRuns else None
+
+            # Resolve the requested task's position in the current experiment.
+            taskIndex = None
+            if task is not None:
+                taskIndex = next(
+                    (index for index, currentTask in enumerate(self.tasks)
+                    if currentTask is task),
+                    None,
+                )
+
+                if taskIndex is None:
+                    pglMessages.warning(
+                        f"Could not find matching task for {task.settings.taskName}"
+                    )
+                    return emptyResult
+
+            # Directory containing this session's saved runs.
             dataPath = (
                 Path(self.settings.dataPath).expanduser()
                 / self.experimentSettings.experimentSaveName
@@ -1051,31 +1150,112 @@ class pglExperiment(pglExperimentBase):
                 / self.experimentSettings.sessionName
             )
 
-            # files that indicate there is an actual run            
-            requiredFiles = {"experimentSettings.json", "settings.json", "state.json", "data.json"}
+            if not dataPath.is_dir():
+                return emptyResult
 
-            # find all the run directories
-            runDirs = [
+            requiredFiles = (
+                "experimentSettings.json",
+                "settings.json",
+                "state.json",
+                "data.json",
+            )
+
+            def isRunDirectory(directory):
+                return directory.is_dir() and all(
+                    (directory / fileName).is_file()
+                    for fileName in requiredFiles
+                )
+
+            # Look for runDirs
+            runDirs = (
                 directory
-                for directory in [dataPath, *dataPath.rglob("*")]
-                if directory.is_dir() and all((directory / fileName).is_file() for fileName in requiredFiles)
+                for directory in dataPath.iterdir()
+                if isRunDirectory(directory)
+            )
+
+            runs = [
+                pglRun(fullDataPath=runDir)
+                for runDir in runDirs
             ]
 
-            # init variables
-            lastRunTime = 0
-            lastRun = None
+            if not runs:
+                return emptyResult
+
+            runs.sort(key=lambda run: run.data.startTime, reverse=True)
+
+            # Only inspect the latest run unless all runs were requested.
+            selectedRuns = runs if allRuns else runs[:1]
+
+            if task is None:
+                return selectedRuns if allRuns else selectedRuns[0]
+
+            matchingTasks = []
+            for run in selectedRuns:
+                savedTask = run.getTaskAt(taskIndex)
+                if savedTask is not None:
+                    matchingTasks.append(savedTask)
+
+            if allRuns:
+                return matchingTasks
+
+            return matchingTasks[0] if matchingTasks else None
             
-            # check all runs and find the last one
-            for runDir in runDirs:
-                fullDataPath = dataPath / runDir
-                run = pglRun(fullDataPath=fullDataPath)
-                if run.data.startTime > lastRunTime:
-                    lastRun = run
-            return lastRun
-        
         except Exception as e:
             pglMessages.warning(f"Unable to load last run: {e}")
-    
+
+    def getLastRunParameters(self, task=None):
+        '''
+        Get the parameters from the last run
+        '''
+        lastRun = self.getLastRun(task)
+        if lastRun: 
+            return lastRun.parameters
+        else:
+            None
+            
+    def printLastRuns(self, task):
+        '''
+        displays last runs in session
+        eex
+        Args:
+            task (pglTask): If set will display how many trials were run in specified task
+            
+        '''
+        try:
+            self.setVerbose(verbose=False)
+            tasks = self.getLastRun(task=task, allRuns=True)
+
+            self.setVerbose()
+            if tasks: self.pgl.printHeader("previous runs from this session", messageType='experiment')
+                        
+            for iRun, task in enumerate(tasks):
+                self.setVerbose()
+                pglMessages.print(f"{iRun:2d}:{task.settings.taskSaveName} nTrials={task.state.currentTrial:3d} ran {pglTimestamp.formatDuration(self.pgl.getSecs()-task.data.startTime)} ago", messageType='experiment')
+                self.setVerbose(verbose=False)
+            
+            self.setVerbose()
+            if tasks: self.pgl.printHeader(messageType='experiment')
+
+            
+        except Exception as e:
+            pglMessages.warning(f"Unable to load last run: {e}")
+
+    def setVerbose(self, verbose=True):
+        if not self.settings.verbose:
+            # only let experiment and parameter message through (warnings will also print)
+            if verbose:
+                pglMessages.setEnabledTypes(['experiment','parameter'])
+            else:
+                pglMessages.setEnabledTypes(set())
+            self.pgl.verbose=False
+
+    def endVerbose(self):
+        if not self.settings.verbose:
+            # Restore verbose settings
+            self.pgl.verbose=True
+            pglMessages.setEnabledTypes(None)
+        
+
 ##############################################
 # Settings for pglTask
 ##############################################
@@ -1202,7 +1382,7 @@ class pglTaskSettings(pglTraitSettings):
                     # Already correct type
                     converted_params.append(item)
                 else:
-                    print(f"Warning: Unexpected type in parameters: {type(item)}")
+                    pglMessages.warning(f"Warning: Unexpected type in parameters: {type(item)}",level=1)
                     converted_params.append(item)
             data['parameters'] = converted_params
         
@@ -1235,7 +1415,7 @@ class pglTaskData(pglTraitSettings):
     # make sure that any settings that the experimenter writes into settings get saved
     _serializeUnregisteredFields = True
 
-    def display(self, taskName="task", responseMapping=None, ax=None):
+    def display(self, taskName="task", responseMapping=None, nTotalTrials=None, ax=None):
         '''
         Display the experiment data.
         '''
@@ -1246,7 +1426,7 @@ class pglTaskData(pglTraitSettings):
         # get trial timestamps
         trialTimestamps = np.array([e.timestamp for e in self.events if isinstance(e, pglEventTrial)])
         if len(trialTimestamps) <= 2:
-            print("(pglTaskData:display) Insufficient trial events found to display.")
+            pglMessages.message("Insufficient trial events found to display.")
             return
         
         # get the max trial length
@@ -1281,20 +1461,33 @@ class pglTaskData(pglTraitSettings):
                     if event.responseType in responseCounts:
                         responseCounts[event.responseType] += 1
                         
-        timeline.setTitle(f"{taskName}: {nTrials} trials")
+        # compute duration
+        if self.endTime is not None and self.startTime is not None:
+            duration = pglTimestamp.formatDuration(self.endTime-self.startTime)
+        else:
+            duration = ""
         
-        # display legend
+        if nTotalTrials is not None and not np.isinf(nTotalTrials):
+            trials = f"{nTrials}/{int(nTotalTrials)}"
+        else:
+            trials = f"{nTrials}"
+            
+        timeline.setTitle(f"{taskName}: {trials} trials, {duration}")
+        
+        # Display legend.
         legend = [{'label': 'Segment', 'color': 'blue'}]
-        # add the response values
-        if gotResponse:
-            for respType, (label, color) in responseMapping.items():
-                # get statistics for this response type
-                count = responseCounts.get(respType, 0)
-                percent = (count / sum(responseCounts.values()) * 100) if nTrials > 0 else 0
-                legend.append({'label': f'{label} (n={count}: {percent:.1f}%)', 'color': color})
-        timeline.addLegend(legend)
-        if not ax: timeline.show()
 
+        if gotResponse:
+            totalResponses = sum(responseCounts.values())
+            for respType, (label, color) in responseMapping.items():
+                count = responseCounts.get(respType, 0)
+                if count != 0:
+                    percent = count / totalResponses * 100 if totalResponses > 0 else 0
+                    legend.append({'label': f'{label} (n={count}: {percent:.1f}%)', 'color': color})
+
+        timeline.addLegend(legend)
+        if ax is None:
+            timeline.show()
 ##############################################
 # Task base 
 ##############################################
@@ -1309,10 +1502,10 @@ class pglTaskBase(pglTraitSettings):
         Save the task settings, state and data.
         '''
         try:
-            dataPath = Path(dataPath) / self.getTaskDirectoryName()
+            dataPath = Path(dataPath) / self._getTaskDirectoryName()
             dataPath.mkdir(parents=True, exist_ok=True)
         except Exception as e:
-            print(f"(pglTask:save) ❌ Could not create task data directory {dataPath}: {e}")
+            pglMessages.warning(f"Could not create task data directory {dataPath}: {e}")
             return
         
         # save settings, state and data
@@ -1330,21 +1523,26 @@ class pglTaskBase(pglTraitSettings):
             pglMessages.warning(f"Could not save task parameters to {dataPath}: {e}")
         pglMessages.message(f"Saved task {self.settings.taskName} to {dataPath}")
 
-    def getTaskDirectoryName(self):
+    def _getTaskDirectoryName(self):
         """Return the directory name used to save this task."""
-        taskDirectoryName = self.settings.taskSaveName
-        phaseNum = self.settings.phaseNum
 
-        if phaseNum is not None and phaseNum != 0:
-            taskDirectoryName += f"Phase{phaseNum:02d}"
+        #taskDirectoryName = f"task{self.settings.taskID:02d}_{self.settings.taskSaveName}"
+        taskDirectoryName = self.getTaskDirectoryName(taskID=self.settings.taskID-1,taskName=self.settings.taskSaveName)
 
         return taskDirectoryName
+    
+    @classmethod
+    def getTaskDirectoryName(cls, taskID, taskName):
+        
+        taskDirectoryName = f"task{taskID+1:02d}_{taskName}"
+        return taskDirectoryName
+    
     @classmethod
     def load(cls, dataPath, filesystem=None):
         '''
         Load the task data.
         '''
-        print(f"(pglTask:load) Loading task data from: {dataPath}")
+        pglMessages.message(f"(pglTask:load) Loading task data from: {dataPath}")
 
         # validate filesystem
         filesystem, taskPath, _ = pglBase.validateFilesystem(filesystem, dataPath)
@@ -1384,7 +1582,7 @@ class pglTaskBase(pglTraitSettings):
         '''
         Display the task data
         '''
-        self.data.display(taskName=self.settings.taskName, ax=ax)
+        self.data.display(taskName=self.settings.taskName, nTotalTrials=self.settings.nTrials, ax=ax)
     
     def print(self):
         '''
@@ -1402,21 +1600,21 @@ class pglTaskBase(pglTraitSettings):
             return
         
         # print task name and number of trials
-        print(f"Task: {self.settings.taskName} | Trials: {self.state.currentTrial+1}")
-        print(f"Duration={timestamp.formatDuration(self.data.endTime - self.data.startTime)} | startTime={self.data.startTime} | endTime={self.data.endTime}")
+        pglMessages.print(f"Task: {self.settings.taskName} | Trials: {self.state.currentTrial+1}")
+        pglMessages.print(f"Duration={timestamp.formatDuration(self.data.endTime - self.data.startTime)} | startTime={self.data.startTime} | endTime={self.data.endTime}")
 
         # print seglen and waitFor
-        print(f"seglen={self.settings.seglen}")
-        print(f"waitUntilVolumeTrigger={self.settings.waitUntilVolumeTrigger}")
+        pglMessages.print(f"seglen={self.settings.seglen}")
+        pglMessages.print(f"waitUntilVolumeTrigger={self.settings.waitUntilVolumeTrigger}")
                 
         # print fixedParameters
-        print('\n'.join(f"{key}={value}" for key, value in self.settings.fixedParameters.items()))
-        print('-' * 40)
+        pglMessages.print('\n'.join(f"{key}={value}" for key, value in self.settings.fixedParameters.items()))
+        pglMessages.print('-' * 40)
         
 
         # print parameters
         for p in self.parameters:
-            print(f"{p.settings.name}")
+            pglMessages.print(f"{p.settings.name}")
         
         # print trial by trial information
         for iTrial, params in enumerate(self.data.params):
@@ -1428,9 +1626,9 @@ class pglTaskBase(pglTraitSettings):
             else:
                 trialVolume = None
             if trialVolume is None:
-                print(f"Trial {iTrial+1} at {trialStart:.2f}s: " + ', '.join(f"{key}={value}" for key, value in params.items()))
+                pglMessages.print(f"Trial {iTrial+1} at {trialStart:.2f}s: " + ', '.join(f"{key}={value}" for key, value in params.items()))
             else:
-                print(f"Trial {iTrial+1} at {trialStart:.2f}s (vol={trialVolume}): " + ', '.join(f"{key}={value}" for key, value in params.items()))
+                pglMessages.print(f"Trial {iTrial+1} at {trialStart:.2f}s (vol={trialVolume}): " + ', '.join(f"{key}={value}" for key, value in params.items()))
                           
 ##############################################
 # Task class
@@ -1574,12 +1772,12 @@ class pglTask(pglTaskBase):
         ]
 
         # print trial
-        print(f"({self.settings.taskName}) Trial {self.state.currentTrial+1}: ", end='')
+        pglMessages.print(f"({self.settings.taskName}) Trial {self.state.currentTrial+1}: ", end='', messageType='experiment')
         
         # and variable settings
         for name,value in self.data.params[-1].items():
-            print(f'{name}={value}', end=' ')
-        print(f"")
+            pglMessages.print(f'{name}={value}', end=' ', messageType='experiment')
+        pglMessages.print(f"", messageType='experiment')
 
     def endTrial(self, endTime):
         '''
@@ -1679,10 +1877,10 @@ class pglTask(pglTaskBase):
         self.endTask()
         
         # record end time
-        print(f"Ending task {self.settings.taskName}")
+        pglMessages.message(f"Ending task {self.settings.taskName}",messageType='experiment')
         endTime = self.pgl.getSecs()
         self.data.endTime = endTime
-        
+        pglMessages.message(f"THE END TIME IS HERE: {endTime} {self.data.endTime}")
         # put in time stamps for end of last segment and trial
         self.data.events.append(pglEventSegment(self.state.currentSegment, endTime, eventType=pglEventSegment.boundaryType.END))
         self.data.events.append(pglEventTrial(self.state.currentTrial, endTime, eventType=pglEventTrial.boundaryType.END))
@@ -1745,6 +1943,7 @@ class pglExperimentSettings(pglTraitSettings):
 ##############################################
 class pglExperimentData(pglTraitSettings):
     startTime = Float(0.0, help="Time in secs of start of experiment")
+    startDateTime = Unicode("", help="Experiment start date and time in ISO format")
     endTime = Float(0.0, help="Time in secs of end of experiment")
     events = List(Instance(pglEvent), default_value=[], help="List of events from experiment")
 
@@ -1772,7 +1971,7 @@ class pglExperimentData(pglTraitSettings):
         Display the experiment data.
         '''
         if len(self.events) == 0:
-            print("(pglExperimentData) No events to display.")
+            pglMessages.print("(pglExperimentData) No events to display.")
             return
         
         # get info from experiment if provided
@@ -1812,8 +2011,14 @@ class pglExperimentData(pglTraitSettings):
             elif event.type == "volumeTrigger":
                 timeline.addTriangleMarker(time=event.timestamp - self.startTime, color='blue', direction='up')
                 nVols += 1
-                
-        timeline.setTitle("Experiment Events")
+        
+        if self.startDateTime != "":
+            dateTime = datetime.fromisoformat(self.startDateTime)
+            readableTime = dateTime.strftime("%I:%M %p").lstrip("0")
+            timeline.setTitle(f"Experiment Events: {dateTime:%b. %d, %Y} at {readableTime}")
+        else:
+            timeline.setTitle("Experiment Events")
+            
         timeline.addLegend([{'label': f'Keypress (n={nKeys})', 'color': 'green'},{'label': f'Volumes (n={nVols})', 'color': 'blue'}])
         if not ax: timeline.show()
     def getTriggerStats(self):
@@ -2066,7 +2271,7 @@ class timelinePlot:
         """
         plt.tight_layout()
         plt.savefig(filename, dpi=dpi, bbox_inches='tight')
-        print(f"Timeline saved to {filename}")
+        pglMessages.message(f"Timeline saved to {filename}")
     
     def getMarkers(self):
         """Return list of all markers added."""
@@ -2094,7 +2299,7 @@ class pglEventTrial(pglEvent):
         self.eventType = eventType.value
 
     def print(self):
-        print(f"(pglEventTrial) Trial {self.eventType} at: {self.timestamp}")
+        pglMessages.message(f"Trial {self.eventType} at: {self.timestamp}")
         
 #################################################################
 # Events that specify segment timing
@@ -2118,7 +2323,7 @@ class pglEventSegment(pglEvent):
         self.timestamp = timestamp
 
     def print(self):
-        print(f"(pglEventSegment) Segment {self.segmentNum} {self.eventType} at: {self.timestamp}")
+        pglMessages.message(f"Segment {self.segmentNum} {self.eventType} at: {self.timestamp}")
         
 
 #################################################################

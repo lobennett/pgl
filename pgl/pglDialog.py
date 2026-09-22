@@ -15,14 +15,17 @@ from PySide6.QtWidgets import (
     QApplication, QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLabel, QLineEdit, QSpinBox, QDoubleSpinBox, QCheckBox, QComboBox,
     QSlider, QPushButton, QWidget, QScrollArea, QDialogButtonBox, QAbstractSpinBox,
-    QStylePainter, QStyleOptionComboBox, QStyle, QMessageBox, QSizePolicy,
+    QStylePainter, QStyleOptionComboBox, QStyle, QMessageBox, QSizePolicy, QListView,
     QGraphicsDropShadowEffect
 )
 from PySide6.QtCore import Qt, QCoreApplication, QTimer, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QStandardItemModel
+from PySide6.QtCore import QPoint, QPropertyAnimation, QEasingCurve
+
 from traitlets import (
     HasTraits, Float, Int, List, Unicode, Bool, Tuple, TraitType, Enum
 )
+
 from .pglSerialize import pglSerialize
 import sys, subprocess, tempfile
 from pathlib import Path
@@ -153,7 +156,26 @@ class _pglTraitsDialog(QDialog):
             entry['setter'](value)
         finally:
             self._updatingWidget = False
+            
+    def _onPlotWindowClosed(self):
+        """Reset plot controls when the separate window is closed."""
 
+        self.plotCanvas.setVisible(False)
+        self.plotButtonState = False
+        self.settingsListPlotButtonState = False
+        self.multiSelectPlotButtonState = False
+
+        for state in self._selectedSettings.values():
+            if "plotVisible" in state:
+                state["plotVisible"] = False
+
+        button = self._activePlotButton
+        if button is not None:
+            wasBlocked = button.blockSignals(True)
+            button.setChecked(False)
+            button.blockSignals(wasBlocked)
+
+        self._activePlotButton = None
     #########################################
     # UI construction
     #########################################
@@ -170,17 +192,22 @@ class _pglTraitsDialog(QDialog):
         self.formLayout.setRowWrapPolicy(QFormLayout.DontWrapRows)
 
         for traitName, trait in self._getOrderedTraits().items():
-            if traitName.startswith('_') and not trait.metadata.get("property", None):
+            if traitName.startswith('_') and not trait.metadata.get("property", None) and trait.metadata.get("visible") is not True:
                 continue
             self._addTraitWidget(traitName, trait)
 
-        # Shared matplotlib axis for any plot-button traits
-        self.figure = Figure(figsize=(5, 3))
+        # Shared matplotlib figure, displayed in a separate window.
+        self.plotWindow = _PlotWindow(self)
+        self.figure = Figure(figsize=(10, 7), constrained_layout=True)
         self.plotAxis = self.figure.add_subplot(111)
-        self.plotCanvas = ScrollableFigureCanvas(self.figure)
-        self.plotCanvas.setMinimumHeight(680)
+        self.plotCanvas = _WindowFigureCanvas(self.figure, self.plotWindow)
+
+        plotLayout = QVBoxLayout(self.plotWindow)
+        plotLayout.setContentsMargins(0, 0, 0, 0)
+        plotLayout.addWidget(self.plotCanvas)
+
         self.plotCanvas.setVisible(False)
-        self.formLayout.addRow(self.plotCanvas)
+        self.finished.connect(lambda result: self._onPlotWindowClosed())
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -251,7 +278,20 @@ class _pglTraitsDialog(QDialog):
         # give hint for window to stay on top
         self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
         self.show()
-        
+
+        # Position half a dialog-width to the right of its normal centered position.
+        screenRect = self.screen().availableGeometry()
+        dialogRect = self.frameGeometry()
+
+        #x = screenRect.left() + screenRect.width() // 2
+        x = screenRect.left() + (screenRect.width() - dialogRect.width()) // 2
+        y = screenRect.top() + (screenRect.height() - dialogRect.height()) // 2
+
+        # Keep the dialog within the available screen area.
+        x = max(screenRect.left(), min(x, screenRect.right() - dialogRect.width() + 1))
+        y = max(screenRect.top(), min(y, screenRect.bottom() - dialogRect.height() + 1))
+
+        self.move(x, y)        
     def _getOrderedTraits(self, obj=None):
         """Return traits in class definition order (like getOrderedTraits)."""
         if obj is None:
@@ -294,8 +334,17 @@ class _pglTraitsDialog(QDialog):
                 # if empty list just move on
                 return
             else:
-                self._addMultiSelectList(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
-
+                if trait.metadata.get("style") == "dropdown":
+                    self._addMultiSelectDropdown(
+                        traitName, trait, current, helpText,
+                        settingsObject, layout, settingsKey
+                    )
+                else:
+                    self._addMultiSelectList(
+                        traitName, trait, current, helpText,
+                        settingsObject, layout, settingsKey
+                    )
+                
         # a settings list
         elif isinstance(trait, List) and "settingsListKey" in trait.metadata:
             if not current:
@@ -359,7 +408,7 @@ class _pglTraitsDialog(QDialog):
         maxRowsVisible = trait.metadata.get("maxRowsVisible", 5)
         plotButtonFunction = trait.metadata.get("buttonFunction", None)
         hasPlotButton = trait.metadata.get("hasPlotButton", None)
-        self.multiSelectPlotButtonState = False
+
         if layout is None:
             layout = self.formLayout
 
@@ -367,14 +416,14 @@ class _pglTraitsDialog(QDialog):
         settingsKey = (objectName, traitName)
         self.traitWidgets.setdefault(settingsKey, {})
 
-        state = {"list": current, "focused": current[0], "key": settingsKey, "rows": {}}
+        state = {"list": current, "focused": current[0], "key": settingsKey, "rows": {}, "plotVisible": False}
         self._selectedSettings[settingsKey] = state
 
         # Build the detail rows for whichever object currently has focus
         #--------------------
         def buildRows():
             for name, childTrait in self._getOrderedTraits(current[0]).items():
-                if name.startswith("_") and not childTrait.metadata.get("property", None):
+                if name.startswith("_") and not childTrait.metadata.get("property", None) and childTrait.metadata.get("visible") is not True:
                     continue
                 if hideKey and name == keyTraitName:
                     continue
@@ -387,17 +436,6 @@ class _pglTraitsDialog(QDialog):
         #------------------------------
         def updateFields(obj):
             self._updatingWidget = True
-            # update plot if visible
-            #if self.multiSelectPlotButtonState:
-            #    try:
-            #        buttonFunction = getattr(obj,plotButtonFunction,None)
-            #        if buttonFunction:
-            #            buttonFunction(self.figure)
-            #        else:
-            #            pglMessages.warning(f"Button function {buttonFunction} not found for {obj}")
-            #    except Exception as e:
-            #        pglMessages.warning(f"Could not run {buttonFunction}: {e}")
-            # update fields
             try:
                 for name in childNames:
                     # read what the underlying property is (usually the trait, but
@@ -436,6 +474,28 @@ class _pglTraitsDialog(QDialog):
             row.style().polish(row)
             row.update()
 
+        def updatePlot():
+            obj = state["focused"]
+
+            try:
+                buttonFunction = getattr(obj, plotButtonFunction, None) if plotButtonFunction else None
+                if not callable(buttonFunction):
+                    pglMessages.warning(f"{obj.name} does not have function: {plotButtonFunction}")
+                    state["plotVisible"] = False
+                    self.plotCanvas.setVisible(False)
+                    return
+
+                self.figure.clear()
+                buttonFunction(self.figure)
+                self.plotCanvas.setVisible(True)
+                self.plotCanvas.draw_idle()
+                state["plotVisible"] = True
+
+            except Exception as e:
+                state["plotVisible"] = False
+                self.plotCanvas.setVisible(False)
+                pglMessages.warning(f"Error calling plotButton function {plotButtonFunction}: {e}")
+        
         # Set which object's details are shown below the scroll area
         #------------------------------
         def setFocus(obj):
@@ -451,9 +511,9 @@ class _pglTraitsDialog(QDialog):
 
             proxy.retarget(obj)
             updateFields(obj)
-            if hasattr(self, "plotCanvas"):
-                self.plotCanvas.setVisible(False)
-                self.plotCanvas.draw()
+
+            if hasPlotButton and state["plotVisible"] and hasattr(self, "plotCanvas"):
+                updatePlot()
                 
         # Keep a checkbox synced if isSelected changes from elsewhere
         # (e.g. select all / select none, or programmatic changes)
@@ -566,26 +626,15 @@ class _pglTraitsDialog(QDialog):
         selectNoneButton.clicked.connect(onSelectNone)
         
         if hasPlotButton:
-            plotButton = QPushButton("display")
+            plotButton = QPushButton(trait.metadata.get("buttonLabel", "display"))
+
             def onPlotButton():
-                try:
-                    # get which list item has focus
-                    obj = state["focused"]
-                    # and call its plot function
-                    buttonFunction = getattr(obj,plotButtonFunction,None)
-                    if buttonFunction:
-                        if not self.multiSelectPlotButtonState:
-                            self.plotCanvas.setVisible(True)
-                            buttonFunction(self.figure)
-                            self.multiSelectPlotButtonState = True
-                        else:
-                            self.plotCanvas.setVisible(False)
-                            self.multiSelectPlotButtonState = False
-                    else:
-                        print(f"{obj.name} does not have function: {plotButtonFunction}")
-                except Exception as e:
-                    pglMessages.warning(f"Error calling plotButton function {plotButtonFunction}: {e}")
-                    
+                if state["plotVisible"]:
+                    state["plotVisible"] = False
+                    self.plotCanvas.setVisible(False)
+                else:
+                    updatePlot()
+
             buttonLayout.addWidget(plotButton)
             plotButton.clicked.connect(onPlotButton)
 
@@ -677,7 +726,7 @@ class _pglTraitsDialog(QDialog):
         #--------------------
         def buildRows():
             for name, childTrait in self._getOrderedTraits(current[0]).items():
-                if name.startswith("_") and not childTrait.metadata.get("property", None):
+                if name.startswith("_") and not childTrait.metadata.get("property", None) and childTrait.metadata.get("visible") is not True:
                     continue
 
                 if hideKey and name == keyTraitName:
@@ -835,9 +884,9 @@ class _pglTraitsDialog(QDialog):
                         self.plotCanvas.draw()
                 except Exception as e:
                     pglMessages.warning(f"Error refreshing plot: {e}")
-            elif hasattr(self, "plotCanvas"):
-                self.plotCanvas.setVisible(False)
-                self.plotCanvas.draw()
+            #elif hasattr(self, "plotCanvas"):
+            #    self.plotCanvas.setVisible(False)
+            #    self.plotCanvas.draw()
                 
             if setDefault:                
                 # update the default checkbox state
@@ -1066,6 +1115,78 @@ class _pglTraitsDialog(QDialog):
         # and show the first item in the list
         showSelection(0)
         
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
+    # ----- add multi select dropdown -----
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
+    def _addMultiSelectDropdown(self, traitName, trait, current, helpText,
+                            settingsObject, layout=None, settingsKey=None):
+        if layout is None:
+            layout = self.formLayout
+
+        keyTraitName = trait.metadata["settingsListKey"]
+
+        combo = CheckableComboBox()
+        combo.setToolTip(helpText)
+
+        # These are the objects currently represented by the dropdown,
+        # not necessarily the objects present when it was first built.
+        state = {
+            "objects": [],
+            "updating": False,
+        }
+
+        def setter(newList):
+            """Retarget the dropdown and load each object's selection state."""
+            wasUpdating = state["updating"]
+            signalsBlocked = combo.blockSignals(True)
+            state["updating"] = True
+
+            try:
+                # Copy the container, but retain the actual settings objects.
+                state["objects"] = list(newList) if newList is not None else []
+
+                combo.clear()
+
+                for obj in state["objects"]:
+                    combo.addItem(
+                        str(getattr(obj, keyTraitName)),
+                        checked=bool(getattr(obj, "isSelected", False)),
+                    )
+            finally:
+                state["updating"] = wasUpdating
+                combo.blockSignals(signalsBlocked)
+                combo.update()
+
+        def onSelectionChanged(_):
+            if self._updatingWidget or state["updating"]:
+                return
+
+            # Snapshot before writing: trait observers may refresh widgets
+            # synchronously while these assignments are taking place.
+            changes = [
+                (obj, combo.isItemChecked(row))
+                for row, obj in enumerate(state["objects"])
+            ]
+
+            state["updating"] = True
+            try:
+                for obj, checked in changes:
+                    if bool(getattr(obj, "isSelected", False)) != checked:
+                        self._commit(obj, "isSelected", checked)
+            finally:
+                state["updating"] = False
+
+        setter(current)
+        combo.selectionChanged.connect(onSelectionChanged)
+
+        self._register(
+            traitName,
+            trait,
+            combo,
+            setter,
+            layout,
+            settingsKey,
+        )
     #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     # ----- Float with min/max -----
     #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
@@ -1434,29 +1555,25 @@ class _pglTraitsDialog(QDialog):
                     self.plotCanvas.draw()
 
         def onSelectionChanged(index):
-            if self._activePlotButton is not None and self._activePlotButton is not button:
-                prev = self._activePlotButton
-                prev.blockSignals(True)
-                prev.setChecked(False)
-                prev.blockSignals(False)
+            if self._updatingWidget or index < 0:
+                return
 
-            button.blockSignals(True)
-            button.setChecked(True)
-            button.blockSignals(False)
+            # Only refresh if this control already owns the displayed plot.
+            refreshPlot = self._activePlotButton is button and button.isChecked() and self.plotWindow.isVisible()
 
-            self._activePlotButton = button
-            self.plotButtonState = True
-
-            # move selected to top
+            # Preserve the existing selected-first settings convention.
             selected = combo.itemText(index)
             opts = [combo.itemText(i) for i in range(combo.count())]
             newList = [selected] + [x for x in opts if x != selected]
 
-            combo.blockSignals(True)
-            self._commit(settingsObject, traitName, newList)
-            combo.blockSignals(False)
+            wasBlocked = combo.blockSignals(True)
+            try:
+                self._commit(settingsObject, traitName, newList)
+            finally:
+                combo.blockSignals(wasBlocked)
 
-            updatePlot()            
+            if refreshPlot:
+                updatePlot()     
         
         button.toggled.connect(onButtonToggled)
         combo.currentIndexChanged.connect(onSelectionChanged)
@@ -1965,7 +2082,329 @@ class _ClickableRow(QWidget):
             self.clicked.emit()
         super().mousePressEvent(event)
 
+from PySide6.QtCore import QEvent, Qt, Signal
+from PySide6.QtGui import QStandardItem, QStandardItemModel
+from PySide6.QtWidgets import (
+    QComboBox,
+    QListView,
+    QStyle,
+    QStyleOptionComboBox,
+    QStylePainter,
+)
 
+
+class CheckableComboBox(QComboBox):
+    selectionChanged = Signal(list)
+    selectionClosed = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self._popupOpen = False
+        self._pressedIndex = None
+
+        self.setEditable(False)
+        self.setView(QListView(self))
+        self.setModel(QStandardItemModel(self))
+
+        # Install these after setView()/setModel(), so our filters
+        # receive events before the combo box's default handlers.
+        self.view().installEventFilter(self)
+        self.view().viewport().installEventFilter(self)
+
+        self.model().itemChanged.connect(self._onItemChanged)
+
+    def eventFilter(self, obj, event):
+        eventType = event.type()
+
+        if obj is self.view().viewport():
+            if eventType in (
+                QEvent.Type.MouseButtonPress,
+                QEvent.Type.MouseButtonDblClick,
+            ):
+                if event.button() == Qt.MouseButton.LeftButton:
+                    index = self.view().indexAt(
+                        event.position().toPoint()
+                    )
+
+                    self._pressedIndex = (
+                        index if index.isValid() else None
+                    )
+
+                    if index.isValid():
+                        self.view().setCurrentIndex(index)
+
+                    # Prevent Qt from treating this as a normal
+                    # single-selection combo box click.
+                    return True
+
+            elif eventType == QEvent.Type.MouseButtonRelease:
+                if event.button() == Qt.MouseButton.LeftButton:
+                    index = self.view().indexAt(
+                        event.position().toPoint()
+                    )
+
+                    if (
+                        self._pressedIndex is not None
+                        and index.isValid()
+                        and index == self._pressedIndex
+                    ):
+                        self._toggleItem(index.row())
+
+                    self._pressedIndex = None
+
+                    # Consume release too, so the popup stays open.
+                    return True
+
+        if obj is self.view() or obj is self.view().viewport():
+            if eventType == QEvent.Type.KeyPress:
+                if event.key() == Qt.Key.Key_Space:
+                    index = self.view().currentIndex()
+
+                    if index.isValid() and not event.isAutoRepeat():
+                        self._toggleItem(index.row())
+
+                    return True
+
+                if event.key() in (
+                    Qt.Key.Key_Return,
+                    Qt.Key.Key_Enter,
+                    Qt.Key.Key_Escape,
+                ):
+                    self.hidePopup()
+                    return True
+
+        return super().eventFilter(obj, event)
+
+    def paintEvent(self, event):
+        """Draw the normal combo box with our selection summary."""
+        option = QStyleOptionComboBox()
+        self.initStyleOption(option)
+
+        count = len(self.checkedItems())
+        option.currentText = (
+            "None selected" if count == 0 else f"{count} selected"
+        )
+
+        # Do not display the current item's icon in the summary.
+        option.currentIcon = type(option.currentIcon)()
+
+        painter = QStylePainter(self)
+        painter.drawComplexControl(
+            QStyle.ComplexControl.CC_ComboBox,
+            option,
+        )
+        painter.drawControl(
+            QStyle.ControlElement.CE_ComboBoxLabel,
+            option,
+        )
+
+    def showPopup(self):
+        self._pressedIndex = None
+        self.view().setMinimumWidth(self.width())
+
+        super().showPopup()
+        self._popupOpen = self.view().isVisible()
+
+    def hidePopup(self):
+        wasOpen = self._popupOpen
+        self._popupOpen = False
+        self._pressedIndex = None
+
+        super().hidePopup()
+        self.update()
+
+        if wasOpen:
+            self.selectionClosed.emit(len(self.checkedItems()))
+
+    def addItem(self, text, userData=None, checked=False):
+        item = QStandardItem(text)
+
+        item.setFlags(
+            Qt.ItemFlag.ItemIsEnabled
+            | Qt.ItemFlag.ItemIsSelectable
+            | Qt.ItemFlag.ItemIsUserCheckable
+        )
+
+        if userData is not None:
+            item.setData(userData, Qt.ItemDataRole.UserRole)
+
+        item.setCheckState(
+            Qt.CheckState.Checked
+            if checked
+            else Qt.CheckState.Unchecked
+        )
+
+        self.model().appendRow(item)
+        self.update()
+
+    def addItems(self, texts, checked=False):
+        for text in texts:
+            self.addItem(text, checked=checked)
+
+    def checkedItems(self):
+        return [
+            self.model().item(row).text()
+            for row in range(self.model().rowCount())
+            if self.isItemChecked(row)
+        ]
+
+    def checkedData(self):
+        return [
+            self.model().item(row).data(Qt.ItemDataRole.UserRole)
+            for row in range(self.model().rowCount())
+            if self.isItemChecked(row)
+        ]
+
+    def setItemChecked(self, index, checked=True):
+        if not 0 <= index < self.model().rowCount():
+            return
+
+        item = self.model().item(index)
+        item.setCheckState(
+            Qt.CheckState.Checked
+            if checked
+            else Qt.CheckState.Unchecked
+        )
+
+        # itemChanged handles updating and emitting the signal.
+
+    def isItemChecked(self, index):
+        if not 0 <= index < self.model().rowCount():
+            return False
+
+        return (
+            self.model().item(index).checkState()
+            == Qt.CheckState.Checked
+        )
+
+    def _toggleItem(self, row):
+        item = self.model().item(row)
+
+        if item is not None and item.isEnabled() and item.isCheckable():
+            self.setItemChecked(row, not self.isItemChecked(row))
+
+    def _onItemChanged(self, item):
+        self.update()
+        self.selectionChanged.emit(self.checkedItems())
+
+class _PlotWindow(QDialog):
+    """Move the main dialog first, then reveal the plot beside it."""
+
+    def __init__(self, owner):
+        super().__init__(owner)
+        self.owner = owner
+        self._savedGeometry = None
+        self._opening = False
+        self._moveAnimation = None
+        self.setWindowTitle("Plot")
+        self.setWindowModality(Qt.NonModal)
+
+    def setVisible(self, visible):
+        if not visible:
+            # Cancel a pending first opening.
+            self._opening = False
+            if self._moveAnimation is not None:
+                self._moveAnimation.stop()
+
+            if self.isVisible():
+                self._savedGeometry = self.saveGeometry()
+
+            super().setVisible(False)
+            return
+
+        if self.isVisible() or self._opening:
+            return
+
+        # Subsequent openings reuse the saved geometry without animation.
+        if self._savedGeometry is not None:
+            super().setVisible(True)
+            self.restoreGeometry(self._savedGeometry)
+            return
+
+        self._opening = True
+
+        screenRect = self.owner.screen().availableGeometry()
+        ownerRect = self.owner.frameGeometry()
+
+        targetX = screenRect.left() + screenRect.width() // 2
+        targetX = max(screenRect.left(), min(targetX, screenRect.right() - ownerRect.width() + 1))
+        shiftX = targetX - ownerRect.left()
+
+        if not shiftX:
+            self._showInitially()
+            return
+
+        startPos = self.owner.pos()
+        self._moveAnimation = QPropertyAnimation(self.owner, b"pos", self)
+        self._moveAnimation.setDuration(250)
+        self._moveAnimation.setStartValue(startPos)
+        self._moveAnimation.setEndValue(startPos + QPoint(shiftX, 0))
+        self._moveAnimation.setEasingCurve(QEasingCurve.InOutCubic)
+        self._moveAnimation.finished.connect(self._showInitially)
+        self._moveAnimation.start()
+
+    def _showInitially(self):
+        if not self._opening:
+            return
+
+        self._opening = False
+
+        # The movement has finished. Show and position before the next paint.
+        super().setVisible(True)
+        self._placeInitially()
+        self.raise_()
+        self.activateWindow()
+
+    def _placeInitially(self):
+        gap = 8
+        ownerRect = self.owner.frameGeometry()
+        screenRect = self.owner.screen().availableGeometry()
+
+        availableWidth = max(0, ownerRect.left() - screenRect.left() - gap)
+        targetWidth = min(ownerRect.width(), availableWidth)
+        targetHeight = min(ownerRect.height(), screenRect.height())
+
+        frameWidth = self.frameGeometry().width() - self.width()
+        frameHeight = self.frameGeometry().height() - self.height()
+
+        minSize = self.minimumSizeHint().expandedTo(self.minimumSize())
+        clientWidth = max(1, minSize.width(), targetWidth - frameWidth)
+        clientHeight = max(1, minSize.height(), targetHeight - frameHeight)
+        self.resize(clientWidth, clientHeight)
+
+        plotRect = self.frameGeometry()
+        x = max(screenRect.left(), ownerRect.left() - gap - plotRect.width())
+        y = max(screenRect.top(), min(ownerRect.top(), screenRect.bottom() - plotRect.height() + 1))
+        self.move(x, y)
+
+    def closeEvent(self, event):
+        self.owner._onPlotWindowClosed()
+        event.accept()
+
+    def reject(self):
+        self.close()
+
+class _WindowFigureCanvas(FigureCanvasQTAgg):
+    """Make existing canvas visibility calls control its separate window."""
+
+    def __init__(self, figure, plotWindow):
+        self.plotWindow = None
+        super().__init__(figure)
+        self.plotWindow = plotWindow
+
+    def setVisible(self, visible):
+        super().setVisible(visible)
+
+        if self.plotWindow is None:
+            return
+
+        self.plotWindow.setVisible(visible)
+
+        if visible:
+            self.plotWindow.raise_()
+            self.plotWindow.activateWindow()
+            
 #####################################################################
 # pglTraitsDialog: what gets called by the user. This rund
 # pglTraitsDialogStandalone which runs outside the jupyter notebook

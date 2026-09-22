@@ -19,6 +19,7 @@ from .pglPipeline import pglActionable
 from .pglMessages import pglMessages
 from types import SimpleNamespace
 import pandas as pd
+from .pglExperiment import pglTask
 try:
     import mne
 except ImportError:
@@ -41,6 +42,7 @@ class pglRun(pglExperimentBase):
     _settings = Instance(pglSettings, allow_none=True, default_value=None, help="settings that this experiment was run with")
     _data = Instance(pglExperimentData, allow_none=True, default_value=None, help="data from experiemnt")
     _tasks = List(Instance(pglTaskBase), allow_none=True, default_value=None, help="tasks from experiment")
+    _taskCache = Dict(default_value={}, help="Tasks loaded individually by index")
     
     ##########################
     # Lazy-loaded properties
@@ -88,14 +90,14 @@ class pglRun(pglExperimentBase):
     def tasks(self):
         '''Experiment tasks'''
         if self._tasks is None:
-            print("GOT NONE HERE")
             pglMessages.message(f"Loading tasks for: {self.filesystemPrefix}/{self.fullDataPath}")
             filesystem, fullDataPath, _ = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.fullDataPath, filesystemPrefix=self.filesystemPrefix)
             taskNames = self.experimentSettings.tasks
             self._tasks = []
-            for taskName in taskNames:
+            for iTask, taskName in enumerate(taskNames):
                 print(f"taskName: {taskName}")
-                self._tasks.append(pglTaskBase.load(dataPath=f"{fullDataPath}{filesystem.sep}{taskName}", filesystem=filesystem))
+                taskDirName = pglTask.getTaskDirectoryName(iTask,taskName)
+                self._tasks.append(pglTaskBase.load(dataPath=f"{fullDataPath}{filesystem.sep}{taskDirName}", filesystem=filesystem))
         return self._tasks
 
     @tasks.setter
@@ -110,6 +112,47 @@ class pglRun(pglExperimentBase):
             if task.settings.taskSaveName == taskName:
                 return task
         return None
+
+    def getTaskAt(self, taskIndex):
+        """
+        Return one task by index without initializing/loading self.tasks.
+        
+        This supports lazy-loadig without loading all the tasks
+
+        Loaded tasks are cached, so repeated calls for the same index return
+        the same object without reading from disk again.
+        """
+        taskNames = self.experimentSettings.tasks
+
+        if not isinstance(taskIndex, int):
+            raise TypeError(f"taskIndex must be an int, got {type(taskIndex).__name__}")
+
+        if taskIndex < 0:
+            taskIndex += len(taskNames)
+
+        if taskIndex < 0 or taskIndex >= len(taskNames):
+            raise IndexError(f"Task index {taskIndex} is outside 0 to {len(taskNames) - 1}")
+
+        if taskIndex not in self._taskCache:
+            taskName = f"task{taskIndex+1:02d}_{taskNames[taskIndex]}"
+
+            pglMessages.message(
+                f"Loading task {taskIndex}: {taskName} "
+                f"for {self.filesystemPrefix}/{self.fullDataPath}"
+            )
+
+            filesystem, fullDataPath, _ = pglBase.validateFilesystem(
+                filesystem=self.filesystem,
+                dataPath=self.fullDataPath,
+                filesystemPrefix=self.filesystemPrefix,
+            )
+
+            self._taskCache[taskIndex] = pglTaskBase.load(
+                dataPath=str(Path(fullDataPath) / taskName),
+                filesystem=filesystem,
+            )
+
+        return self._taskCache[taskIndex]
 
     def __init__(self, fullDataPath=None, filesystem=None, filesystemPrefix=None):
         '''
@@ -130,27 +173,38 @@ class pglRun(pglExperimentBase):
         '''
         return(", ".join(self.experimentSettings.tasks))
     
-    def display(self, ax=None):
-        '''
-        display plot of the run
-        '''
-        # display
+    def display(self, fig=None):
+        """
+        Display plot of the run.
+
+        If fig is provided, replace its contents with the run plots.
+        """
         try:
-            # compute how many axes we need
             nTasks = len(self.tasks)
-            fig, _ = plt.subplots(nTasks+1,1,figsize=(12,4*(nTasks+1)), constrained_layout=True)
-            
-            # display experiment
-            self.data.display(ax=fig.axes[0])
-            
-            # display tasks
+            nRows = nTasks + 1
+
+            if fig is None:
+                fig = plt.figure(
+                    figsize=(12, 4 * nRows),
+                    constrained_layout=True,
+                )
+            else:
+                fig.clear()
+                fig.set_layout_engine("constrained")
+
+            axes = fig.subplots(nRows, 1, squeeze=False)[:, 0]
+
+            # Display experiment
+            self.data.display(ax=axes[0])
+
+            # Display tasks
             for iTask, task in enumerate(self.tasks):
-                task.display(ax=fig.axes[iTask+1])
-            
-            plt.show()
-            
+                task.display(ax=axes[iTask + 1])
+
+            return fig
+
         except Exception as e:
-            print(f"error: {e}")
+            pglMessages.warning(f"error: {e}")
     
     def getTrialsByParameter(self, parameterName: str, taskName: str = None):
         '''
@@ -268,11 +322,11 @@ class pglMNE(pglActionable):
             pglMessages.warning("mne library is not available. Need to add to environment")
             return
         
-    def add(self, data: mne.io.BaseRaw | mne.BaseEpochs, filename: str = None, filesystemPrefix: str = None):
+    def add(self, data, filename: str = None, filesystemPrefix: str = None):
         '''
         add data to the pglMNE instance. Handles known types like mne raw or epochs
         '''
-        
+        import mne
         # save either raw or epochs
         if isinstance(data, mne.io.BaseRaw):
             self.raws.append(data)
@@ -416,7 +470,7 @@ class pglSession(pglActionable):
     runs = List(Instance(pglRun), allow_none=True, help="List of all runs")
     
     # mne MEG/EEG data
-    mne = Instance(pglMNE, help="MEG/EEG data in the form of an MNE variable")
+    mne = Instance(pglMNE, allow_none=True, help="MEG/EEG data in the form of an MNE variable")
     
     def __init__(self, filesystem=None, filesystemPrefix='', runList=[]):
         '''
