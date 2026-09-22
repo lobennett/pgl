@@ -70,3 +70,4 @@ class pgl(pglBase, pglResolution, pglDraw, pglTransform, pglProfile, pglBatch, p
       pglDialogs.__init__(self, *args, **kwargs)
 __version__ = "1.0.0"
 __author__ = "JLG"
+DBP_INTEGRATION_REVISION = "dbp-prepared-block-v2"
